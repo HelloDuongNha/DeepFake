@@ -13,6 +13,7 @@ def match_color_lab(
     source: np.ndarray,
     target: np.ndarray,
     mask: np.ndarray | None = None,
+    reference_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Match colour statistics in LAB using only the supplied face mask.
 
@@ -34,8 +35,14 @@ def match_color_lab(
         valid = np.asarray(mask) > 16
         if valid.shape != src_lab.shape[:2] or int(np.count_nonzero(valid)) < 16:
             return src
+    if reference_mask is None:
+        reference_valid = valid
+    else:
+        reference_valid = np.asarray(reference_mask) > 16
+        if reference_valid.shape != valid.shape or int(np.count_nonzero(reference_valid)) < 16:
+            reference_valid = valid
     src_values = src_lab[valid]
-    ref_values = ref_lab[valid]
+    ref_values = ref_lab[reference_valid]
     src_mean = src_values.mean(axis=0, dtype=np.float32)
     ref_mean = ref_values.mean(axis=0, dtype=np.float32)
     src_std = np.maximum(src_values.std(axis=0), 1.0)
@@ -43,7 +50,9 @@ def match_color_lab(
     # Keep luminance transfer conservative so Poisson still handles local
     # gradients instead of receiving a globally over-contrasted crop.
     ref_std = np.maximum(ref_std, 1.0)
-    corrected = (src_lab - src_mean) * (ref_std / src_std) + ref_mean
+    gain = np.clip(ref_std / src_std, 0.85, 1.15)
+    offset = np.clip(ref_mean - src_mean, -12.0, 12.0)
+    corrected = (src_lab - src_mean) * gain + src_mean + offset
     return cv2.cvtColor(np.clip(corrected, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
@@ -151,165 +160,6 @@ def create_hairline_safe_mask(
         mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), sigma)
     return mask
 
-def create_lower_mouth_mask(
-    face: Face, frame: Frame
-) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    mouth_cutout = None
-    lower_lip_polygon = None
-    mouth_box = (0,0,0,0)
-
-    landmarks = face.landmark_2d_106
-    if landmarks is not None:
-        # Use outer mouth landmarks (52-71) to capture the full mouth area
-        lower_lip_order = list(range(52, 72))
-        
-        if max(lower_lip_order) >= landmarks.shape[0]:
-            return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-        lower_lip_landmarks = landmarks[lower_lip_order].astype(np.float32)
-
-        # Calculate the center of the landmarks
-        center = np.mean(lower_lip_landmarks, axis=0)
-
-        # Expand the landmarks outward using the mouth_mask_size
-        mouth_mask_size = getattr(modules.globals, "mouth_mask_size", 0.0) # 0-100 slider
-        expansion_factor = 1 + (mouth_mask_size / 100.0) * 2.5
-
-        # Expand with extra downward bias toward chin
-        offsets = lower_lip_landmarks - center
-        chin_bias = 1 + (mouth_mask_size / 100.0) * 1.5
-        scale_y = np.where(offsets[:, 1] > 0, expansion_factor * chin_bias, expansion_factor)
-        expanded_landmarks = lower_lip_landmarks.copy()
-        expanded_landmarks[:, 0] = center[0] + offsets[:, 0] * expansion_factor
-        expanded_landmarks[:, 1] = center[1] + offsets[:, 1] * scale_y
-
-        # Convert back to integer coordinates
-        expanded_landmarks = expanded_landmarks.astype(np.int32)
-
-        # Calculate bounding box for the expanded lower mouth
-        min_x, min_y = np.min(expanded_landmarks, axis=0)
-        max_x, max_y = np.max(expanded_landmarks, axis=0)
-
-        # Add some padding to the bounding box
-        padding = int((max_x - min_x) * 0.1)  # 10% padding
-        min_x = max(0, min_x - padding)
-        min_y = max(0, min_y - padding)
-        max_x = min(frame.shape[1], max_x + padding)
-        max_y = min(frame.shape[0], max_y + padding)
-
-        # Ensure the bounding box dimensions are valid
-        if max_x <= min_x or max_y <= min_y:
-            if (max_x - min_x) <= 1:
-                max_x = min_x + 1
-            if (max_y - min_y) <= 1:
-                max_y = min_y + 1
-
-        # Create the mask
-        mask_roi = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
-        # Shift polygon coordinates relative to the ROI's top-left corner
-        polygon_relative_to_roi = expanded_landmarks - [min_x, min_y]
-        cv2.fillPoly(mask_roi, [polygon_relative_to_roi], 255)
-
-        # Apply Gaussian blur to soften the mask edges (GPU-accelerated when available)
-        mask_roi = gpu_gaussian_blur(mask_roi, (15, 15), 5)
-
-        # Place the mask ROI in the full-sized mask
-        mask[min_y:max_y, min_x:max_x] = mask_roi
-
-        # Extract the masked area from the frame
-        mouth_cutout = frame[min_y:max_y, min_x:max_x].copy()
-
-        # Return the expanded lower lip polygon in original frame coordinates
-        lower_lip_polygon = expanded_landmarks
-        mouth_box = (min_x, min_y, max_x, max_y)
-
-    return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-def create_eyes_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    eyes_cutout = None
-    landmarks = face.landmark_2d_106
-    if landmarks is not None:
-        # Left eye landmarks (87-96) and right eye landmarks (33-42)
-        left_eye = landmarks[87:96]
-        right_eye = landmarks[33:42]
-        
-        # Calculate centers and dimensions for each eye
-        left_eye_center = np.mean(left_eye, axis=0).astype(np.int32)
-        right_eye_center = np.mean(right_eye, axis=0).astype(np.int32)
-        
-        # Calculate eye dimensions with size adjustment
-        def get_eye_dimensions(eye_points):
-            x_coords = eye_points[:, 0]
-            y_coords = eye_points[:, 1]
-            width = int((np.max(x_coords) - np.min(x_coords)) * (1 + modules.globals.mask_down_size * modules.globals.eyes_mask_size))
-            height = int((np.max(y_coords) - np.min(y_coords)) * (1 + modules.globals.mask_down_size * modules.globals.eyes_mask_size))
-            return width, height
-        
-        left_width, left_height = get_eye_dimensions(left_eye)
-        right_width, right_height = get_eye_dimensions(right_eye)
-        
-        # Add extra padding
-        padding = int(max(left_width, right_width) * 0.2)
-        
-        # Calculate bounding box for both eyes
-        min_x = min(left_eye_center[0] - left_width//2, right_eye_center[0] - right_width//2) - padding
-        max_x = max(left_eye_center[0] + left_width//2, right_eye_center[0] + right_width//2) + padding
-        min_y = min(left_eye_center[1] - left_height//2, right_eye_center[1] - right_height//2) - padding
-        max_y = max(left_eye_center[1] + left_height//2, right_eye_center[1] + right_height//2) + padding
-        
-        # Ensure coordinates are within frame bounds
-        min_x = max(0, min_x)
-        min_y = max(0, min_y)
-        max_x = min(frame.shape[1], max_x)
-        max_y = min(frame.shape[0], max_y)
-        
-        # Create mask for the eyes region
-        mask_roi = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
-        
-        # Draw ellipses for both eyes
-        left_center = (left_eye_center[0] - min_x, left_eye_center[1] - min_y)
-        right_center = (right_eye_center[0] - min_x, right_eye_center[1] - min_y)
-        
-        # Calculate axes lengths (half of width and height)
-        left_axes = (left_width//2, left_height//2)
-        right_axes = (right_width//2, right_height//2)
-        
-        # Draw filled ellipses
-        cv2.ellipse(mask_roi, left_center, left_axes, 0, 0, 360, 255, -1)
-        cv2.ellipse(mask_roi, right_center, right_axes, 0, 0, 360, 255, -1)
-        
-        # Apply Gaussian blur to soften mask edges (GPU-accelerated when available)
-        mask_roi = gpu_gaussian_blur(mask_roi, (15, 15), 5)
-        
-        # Place the mask ROI in the full-sized mask
-        mask[min_y:max_y, min_x:max_x] = mask_roi
-        
-        # Extract the masked area from the frame
-        eyes_cutout = frame[min_y:max_y, min_x:max_x].copy()
-        
-        # Create polygon points for visualization
-        def create_ellipse_points(center, axes):
-            t = np.linspace(0, 2*np.pi, 32)
-            x = center[0] + axes[0] * np.cos(t)
-            y = center[1] + axes[1] * np.sin(t)
-            return np.column_stack((x, y)).astype(np.int32)
-        
-        # Generate points for both ellipses
-        left_points = create_ellipse_points((left_eye_center[0], left_eye_center[1]), (left_width//2, left_height//2))
-        right_points = create_ellipse_points((right_eye_center[0], right_eye_center[1]), (right_width//2, right_height//2))
-        
-        # Combine points for both eyes
-        eyes_polygon = np.vstack([left_points, right_points])
-        
-    return mask, eyes_cutout, (min_x, min_y, max_x, max_y), eyes_polygon
-
-
-# The original routines above are kept for compatibility with old saved UI
-# state.  These definitions are the active implementations: they use disjoint
-# feature groups and are intentionally vectorized so the mouth slider cannot
-# enlarge an ROI over the eyes.
 def _feature_landmarks(face: Face):
     landmarks = getattr(face, "landmark_2d_106", None)
     if landmarks is None:
@@ -364,12 +214,17 @@ def create_lower_mouth_mask(
     expanded[:, 0] = np.clip(expanded[:, 0], 0, frame.shape[1] - 1)
     expanded[:, 1] = np.clip(expanded[:, 1], 0, frame.shape[0] - 1)
     expanded = np.rint(expanded).astype(np.int32)
+    # The 68-point layout includes inner lip points; its index order is not a
+    # single simple outline. A hull makes the paint area stable for both layouts.
+    expanded = cv2.convexHull(expanded).reshape(-1, 2)
     span = np.ptp(expanded, axis=0)
     pad_x = max(1, int(round(span[0] * 0.10)))
     pad_y = max(1, int(round(span[1] * 0.10)))
     min_x = max(0, int(np.min(expanded[:, 0])) - pad_x)
     max_x = min(frame.shape[1], int(np.max(expanded[:, 0])) + pad_x + 1)
     min_y = max(0, int(np.min(expanded[:, 1])) - pad_y)
+    if eye_sets:
+        min_y = max(min_y, int(np.ceil(safe_top)))
     max_y = min(frame.shape[0], int(np.max(expanded[:, 1])) + pad_y + 1)
     if max_x <= min_x or max_y <= min_y:
         return mask, mouth_cutout, mouth_box, mouth_polygon

@@ -47,6 +47,23 @@ _poisson_cached_mask: Optional[np.ndarray] = None
 _poisson_cached_key: Optional[tuple] = None
 
 
+def _lower_cheek_reference_mask(face_mask: np.ndarray) -> np.ndarray:
+    """Sample the original lower cheek and jaw near the blend boundary."""
+    binary = (face_mask > 127).astype(np.uint8)
+    if not np.any(binary):
+        return binary
+    width = max(3, min(face_mask.shape[:2]) // 24)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (width * 2 + 1, width * 2 + 1))
+    inner = cv2.erode(binary, kernel)
+    band = binary - inner
+    # The upper edge can contain eyebrows or hair; keep the lower half where
+    # the real cheek/jaw colour is the useful match for the face and neck.
+    ys = np.flatnonzero(np.any(binary, axis=1))
+    cutoff = int((ys[0] + ys[-1]) * 0.5)
+    band[:cutoff] = 0
+    return band * 255
+
+
 def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                          target_face: Face, affine_matrix: np.ndarray = None,
                          bgr_fake: np.ndarray = None) -> Frame:
@@ -98,7 +115,10 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                                 source_roi = swapped_frame[my1:my2 + 1, mx1:mx2 + 1]
                                 reference_roi = original_frame[my1:my2 + 1, mx1:mx2 + 1]
                                 corrected = match_color_lab(
-                                    source_roi, reference_roi, roi_mask
+                                    source_roi,
+                                    reference_roi,
+                                    roi_mask,
+                                    _lower_cheek_reference_mask(roi_mask),
                                 )
                                 np.copyto(
                                     source_roi,
@@ -154,7 +174,12 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
         if getattr(modules.globals, "color_match", True):
             source_roi = swapped_frame[ry0:ry1, rx0:rx1]
             reference_roi = original_frame[ry0:ry1, rx0:rx1]
-            corrected = match_color_lab(source_roi, reference_roi, roi_mask)
+            corrected = match_color_lab(
+                source_roi,
+                reference_roi,
+                roi_mask,
+                _lower_cheek_reference_mask(roi_mask),
+            )
             np.copyto(
                 source_roi,
                 corrected,
@@ -628,9 +653,6 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # Now, work with the guaranteed uint8 'swapped_frame'
 
     if mouth_mask_enabled: # Check if mouth_mask is enabled
-        # Create a mask for the target face
-        face_mask = create_face_mask(target_face, original_frame) # Use original_frame for mask creation geometry
-
         # Create the mouth mask using the ORIGINAL frame (before swap) for cutout
         mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
             create_lower_mouth_mask(target_face, original_frame) # Use original_frame for real mouth cutout
@@ -640,7 +662,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if mouth_cutout is not None and mouth_box != (0,0,0,0):
             # Apply mouth area (from original) onto the 'swapped_frame'
             swapped_frame = apply_mouth_area(
-                swapped_frame, mouth_cutout, mouth_box, face_mask, lower_lip_polygon
+                swapped_frame, mouth_cutout, mouth_box, lower_lip_polygon
             )
 
             # Draw bounding box only while slider is being dragged
@@ -1159,140 +1181,6 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
 # MASKING FUNCTIONS (Mostly unchanged, added safety checks and minor improvements)
 # ==========================
 
-def create_lower_mouth_mask(
-    face: Face, frame: Frame
-) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    mouth_cutout = None
-    lower_lip_polygon = None # Initialize
-    mouth_box = (0,0,0,0) # Initialize
-
-    # Validate face and landmarks
-    if face is None or not hasattr(face, 'landmark_2d_106'):
-        # print("Warning: Invalid face object passed to create_lower_mouth_mask.")
-        return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-    landmarks = face.landmark_2d_106
-
-    # Check landmark validity
-    if landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape[0] < 106:
-        # print("Warning: Invalid or insufficient landmarks for mouth mask.")
-        return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-    try: # Wrap main logic in try-except
-        # Outer mouth/lip landmarks (52-63) — the lip outline only. In this
-        # repo's insightface 2d106 convention these 12 points, taken in index
-        # order, form a SIMPLE (non-self-intersecting) closed polygon that
-        # cv2.fillPoly fills as one solid region directly over the mouth.
-        # This is the last shipped, known-good landmark set; range(52,72)
-        # (the regression) added the inner-lip points and made the path
-        # self-intersect, and the ancient [65,66,62,...,0,8,7...] indices
-        # belong to a different/older landmark convention (they land on the
-        # inner lip + random jaw points, so the mask never covers the mouth).
-        lower_lip_order = list(range(52, 64))
-
-        # All indices must be valid for the loaded landmark set
-        if max(lower_lip_order) >= landmarks.shape[0]:
-            # print(f"Warning: Landmark index out of bounds for shape {landmarks.shape[0]}.")
-            return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-        lower_lip_landmarks = landmarks[lower_lip_order].astype(np.float32)
-
-        # Filter out potential NaN or Inf values in landmarks
-        if not np.all(np.isfinite(lower_lip_landmarks)):
-            # print("Warning: Non-finite values detected in lower lip landmarks.")
-            return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-        center = np.mean(lower_lip_landmarks, axis=0)
-        if not np.all(np.isfinite(center)): # Check center calculation
-            # print("Warning: Could not calculate valid center for mouth mask.")
-            return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-        # Drive expansion from the Mouth Mask slider so it actually responds.
-        # The known-good version expanded by the now-unused mask_down_size
-        # constant, which is why the slider had no effect.
-        # s: 0.0 (slider ~0, tight lip outline) -> 1.0 (slider 100, mouth->chin).
-        mouth_mask_size = getattr(modules.globals, "mouth_mask_size", 0.0) # 0-100 slider
-        s = max(0.0, min(1.0, mouth_mask_size / 100.0))
-
-        # Uniformly scaling a simple polygon about its centroid keeps it simple
-        # (no self-intersection). x grows with expansion_factor; points below
-        # centre (toward the chin) also get an extra downward stretch so high
-        # slider values reach from the mouth down to the chin.
-        expansion_factor = 1.0 + s * 2.0          # 1.0x -> 3.0x
-        chin_bias = 1.0 + s * 2.0                  # extra downward stretch
-        offsets = lower_lip_landmarks - center
-        scale_y = np.where(offsets[:, 1] > 0,
-                           expansion_factor * chin_bias, expansion_factor)
-        expanded_landmarks = lower_lip_landmarks.copy()
-        expanded_landmarks[:, 0] = center[0] + offsets[:, 0] * expansion_factor
-        expanded_landmarks[:, 1] = center[1] + offsets[:, 1] * scale_y
-
-        # Ensure landmarks are finite after adjustments
-        if not np.all(np.isfinite(expanded_landmarks)):
-            # print("Warning: Non-finite values detected after expanding landmarks.")
-            return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-        expanded_landmarks = expanded_landmarks.astype(np.int32)
-
-        min_x, min_y = np.min(expanded_landmarks, axis=0)
-        max_x, max_y = np.max(expanded_landmarks, axis=0)
-
-        # Add padding *after* initial min/max calculation
-        padding_ratio = 0.1 # Percentage padding
-        padding_x = int((max_x - min_x) * padding_ratio)
-        padding_y = int((max_y - min_y) * padding_ratio) # Use y-range for y-padding
-
-        # Apply padding and clamp to frame boundaries
-        frame_h, frame_w = frame.shape[:2]
-        min_x = max(0, min_x - padding_x)
-        min_y = max(0, min_y - padding_y)
-        max_x = min(frame_w, max_x + padding_x)
-        max_y = min(frame_h, max_y + padding_y)
-
-
-        if max_x > min_x and max_y > min_y:
-            # Create the mask ROI
-            mask_roi_h = max_y - min_y
-            mask_roi_w = max_x - min_x
-            mask_roi = np.zeros((mask_roi_h, mask_roi_w), dtype=np.uint8)
-
-            # Shift polygon coordinates relative to the ROI's top-left corner
-            polygon_relative_to_roi = expanded_landmarks - [min_x, min_y]
-
-            # Draw polygon on the ROI mask
-            cv2.fillPoly(mask_roi, [polygon_relative_to_roi], 255)
-
-            # Apply Gaussian blur (GPU-accelerated when available)
-            blur_k_size = getattr(modules.globals, "mask_blur_kernel", 15) # Default 15
-            blur_k_size = max(1, blur_k_size // 2 * 2 + 1) # Ensure odd
-            mask_roi = gpu_gaussian_blur(mask_roi, (blur_k_size, blur_k_size), 0)
-
-            # Place the mask ROI in the full-sized mask
-            mask[min_y:max_y, min_x:max_x] = mask_roi
-
-            # Extract the masked area from the *original* frame
-            mouth_cutout = frame[min_y:max_y, min_x:max_x].copy()
-
-            lower_lip_polygon = expanded_landmarks # Return polygon in original frame coords
-            mouth_box = (min_x, min_y, max_x, max_y) # Return the calculated box
-        else:
-            # print("Warning: Invalid mouth mask bounding box after padding/clamping.") # Optional debug
-            pass
-
-    except IndexError as idx_e:
-        # print(f"Warning: Landmark index out of bounds during mouth mask creation: {idx_e}") # Optional debug
-        pass
-    except Exception as e:
-        print(f"Error in create_lower_mouth_mask: {e}") # Print unexpected errors
-        # import traceback
-        # traceback.print_exc()
-        pass
-
-    # Return values, ensuring defaults if errors occurred
-    return mask, mouth_cutout, mouth_box, lower_lip_polygon
-
-
 def create_lower_mouth_mask(face: Face, frame: Frame):
     """Use the shared disjoint mouth/eye geometry for the live swap path."""
     return create_shared_lower_mouth_mask(face, frame)
@@ -1359,16 +1247,15 @@ def apply_mouth_area(
     frame: np.ndarray,
     mouth_cutout: np.ndarray,
     mouth_box: tuple,
-    face_mask: np.ndarray, # Full face mask (for blending edges)
     mouth_polygon: np.ndarray, # Specific polygon for the mouth area itself
 ) -> np.ndarray:
 
     # Basic validation
     if (frame is None or mouth_cutout is None or mouth_box is None or
-        face_mask is None or mouth_polygon is None):
+        mouth_polygon is None):
         # print("Warning: Invalid input (None value) to apply_mouth_area") # Optional debug
         return frame
-    if (mouth_cutout.size == 0 or face_mask.size == 0 or len(mouth_polygon) < 3):
+    if (mouth_cutout.size == 0 or len(mouth_polygon) < 3):
         # print("Warning: Invalid input (empty array/polygon) to apply_mouth_area") # Optional debug
         return frame
 

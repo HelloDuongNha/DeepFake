@@ -136,6 +136,36 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(mouth_mask[:90])), 0)
         self.assertEqual(int(np.count_nonzero(eye_mask[90:])), 0)
 
+    def test_68_point_mouth_and_eyes_stay_separate(self):
+        landmarks = np.zeros((68, 2), dtype=np.float32)
+        landmarks[36:42] = np.column_stack((np.linspace(40, 55, 6), np.full(6, 45)))
+        landmarks[42:48] = np.column_stack((np.linspace(85, 100, 6), np.full(6, 45)))
+        angles = np.linspace(0, 2 * np.pi, 20, endpoint=False)
+        landmarks[48:68] = np.column_stack((70 + 20 * np.cos(angles), 110 + 7 * np.sin(angles)))
+        face = SimpleNamespace(landmark_2d_68=landmarks)
+        frame = np.zeros((160, 140, 3), dtype=np.uint8)
+        with patch.object(settings, "mouth_mask_size", 100.0):
+            mouth, _, _, _ = face_masking.create_lower_mouth_mask(face, frame)
+        eyes, _, _, _ = face_masking.create_eyes_mask(face, frame)
+        self.assertGreater(int(np.count_nonzero(mouth)), 0)
+        self.assertGreater(int(np.count_nonzero(eyes)), 0)
+        self.assertEqual(int(np.count_nonzero((mouth > 0) & (eyes > 0))), 0)
+
+    def test_pasting_mouth_preserves_eye_pixels(self):
+        landmarks = np.zeros((106, 2), dtype=np.float32)
+        landmarks[33:43] = np.column_stack((np.linspace(35, 55, 10), np.full(10, 40)))
+        landmarks[87:97] = np.column_stack((np.linspace(85, 105, 10), np.full(10, 40)))
+        angles = np.linspace(0, 2 * np.pi, 12, endpoint=False)
+        landmarks[52:64] = np.column_stack((70 + 18 * np.cos(angles), 108 + 6 * np.sin(angles)))
+        face = SimpleNamespace(landmark_2d_106=landmarks)
+        original = np.full((160, 140, 3), 40, dtype=np.uint8)
+        swapped = np.full_like(original, 180)
+        with patch.object(settings, "mouth_mask_size", 100.0):
+            _, cutout, box, polygon = face_masking.create_lower_mouth_mask(face, original)
+        result = face_swapper.apply_mouth_area(swapped, cutout, box, polygon)
+        self.assertTrue(np.array_equal(result[:70], np.full_like(result[:70], 180)))
+        self.assertLess(int(result[108, 70, 0]), 180)
+
     def test_adaptive_film_grain_adds_subtle_texture(self):
         camera = np.full((32, 32, 3), 120, dtype=np.uint8)
         restored = camera.copy()
