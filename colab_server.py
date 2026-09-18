@@ -42,7 +42,9 @@ def configure_cuda() -> list[str]:
         providers.append("CPUExecutionProvider")
     modules.globals.execution_providers = providers
     modules.globals.execution_threads = 2
-    modules.globals.enhancer_interval = 1
+    # A T4 can run the swap model every frame.  Restoration models are more
+    # expensive, so live mode reuses their aligned result for one frame.
+    modules.globals.enhancer_interval = 2
     modules.globals.many_faces = False
     modules.globals.map_faces = False
     modules.globals.poisson_blend = False
@@ -80,6 +82,9 @@ class LiveProcessor:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        # Gradio may deliver several webcam chunks concurrently.  Drop a chunk
+        # while the GPU is busy instead of building an ever-growing queue.
+        self._compute_lock = threading.Lock()
         self.source_face: Any | None = None
         self.source_path: str | None = None
         self.enhancer_name = "None"
@@ -112,7 +117,13 @@ class LiveProcessor:
             with self._lock:
                 self.source_face = face
                 self.source_path = "browser-upload"
-            return "Source face ready. Start the webcam stream."
+            try:
+                # Load the swap model before the first webcam frame arrives.
+                self._ensure_swapper()
+            except Exception as exc:
+                self.last_error = str(exc)
+                return f"Source ready, but model loading failed: {exc}"
+            return "Source face ready. Swap model loaded; start the webcam stream."
         except Exception as exc:
             self.last_error = str(exc)
             return f"Source error: {exc}"
@@ -144,7 +155,7 @@ class LiveProcessor:
         else:
             from modules.processors.frame import face_enhancer as enhancer
 
-        modules.globals.enhancer_interval = 1
+        modules.globals.enhancer_interval = 2
         return enhancer.process_frame(
             None,
             frame,
@@ -160,20 +171,28 @@ class LiveProcessor:
         if image is None:
             return None
 
-        with self._lock:
-            if enhancer_name != self.enhancer_name:
-                self.enhancer_name = enhancer_name or "None"
-            modules.globals.poisson_blend = bool(poisson)
-            source_face = self.source_face
-
-        if source_face is None:
+        # The browser keeps sending frames while a previous frame is being
+        # processed. Return the last result immediately when the GPU is busy;
+        # this is much smoother than queueing stale frames behind one another.
+        if not self._compute_lock.acquire(blocking=False):
             return image
 
         try:
-            from modules.face_analyser import get_one_face
+            with self._lock:
+                if enhancer_name != self.enhancer_name:
+                    self.enhancer_name = enhancer_name or "None"
+                modules.globals.poisson_blend = bool(poisson)
+                source_face = self.source_face
+
+            if source_face is None:
+                return image
+
+            # Recognition is needed once for the source face, but not for
+            # every webcam frame. Detection-only keeps the CUDA pipeline fast.
+            from modules.face_analyser import detect_one_face_fast
 
             bgr = _as_bgr(image)
-            target_face = get_one_face(bgr)
+            target_face = detect_one_face_fast(bgr)
             if target_face is None:
                 return image
             swapper = self._ensure_swapper()
@@ -184,6 +203,8 @@ class LiveProcessor:
             self.last_error = str(exc)
             print(f"[Colab] frame error: {exc}", flush=True)
             return image
+        finally:
+            self._compute_lock.release()
 
 
 def build_demo(processor: LiveProcessor) -> gr.Blocks:
@@ -221,9 +242,8 @@ def build_demo(processor: LiveProcessor) -> gr.Blocks:
             processor.process,
             inputs=[webcam, enhancer, poisson],
             outputs=preview,
-            concurrency_limit=1,
-            trigger_mode="always_last",
-            stream_every=0.08,
+            concurrency_limit=4,
+            stream_every=0.12,
             time_limit=3600,
         )
     return demo
@@ -243,7 +263,7 @@ def main() -> None:
     processor = LiveProcessor()
     demo = build_demo(processor)
     print("[Colab] Starting Gradio. Keep this cell running.", flush=True)
-    demo.queue(max_size=2, default_concurrency_limit=1)
+    demo.queue(max_size=2, default_concurrency_limit=4)
     demo.launch(
         server_name="0.0.0.0",
         server_port=args.port,
