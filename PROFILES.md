@@ -2,10 +2,11 @@
 
 ## macOS Apple Silicon
 
-Run `./run_mac.sh` for the full UI, or double-click `start.command` for the
-simple launcher. The Mac profile requests 640×360 at 60 fps, CoreML, alpha
-blending, and no enhancer by default. This is a speed preset, not a guaranteed
-output frame rate. The actual camera mode and processing FPS depend on hardware.
+Run `./run_mac.sh` or double-click `start.command` to open the original
+Deep-Live-Cam interface. The Mac profile requests 640×360 at 60 fps, CoreML,
+alpha blending, and no enhancer by default. This is a speed preset, not a
+guaranteed output frame rate. The actual camera mode and processing FPS depend
+on hardware.
 
 To try GPEN-256 every third frame from Terminal:
 
@@ -13,9 +14,10 @@ To try GPEN-256 every third frame from Terminal:
 DLC_ENHANCER=GPEN-256 DLC_ENHANCER_INTERVAL=3 ./run_mac.sh
 ```
 
-The launcher offers the same choices. A cached enhanced face is aligned to the
-current face position on skipped frames, so the entire camera frame is never
-frozen. If FPS is still low, use the no-enhancer preset or request 640×360.
+GPEN/GFPGAN can be selected in the Face Enhancer control. A cached enhanced
+face is aligned to the current face position on skipped frames, so the entire
+camera frame is never frozen. If FPS is still low, leave Face Enhancer set to
+None and keep the 640×360 capture profile.
 
 ## Windows NVIDIA
 

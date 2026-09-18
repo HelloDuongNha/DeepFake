@@ -2,22 +2,20 @@
 
 ## Launch
 
-Double-click `start.command` to open the simple launcher, or run
-`./start.command` in Terminal. Choose a source image and camera, then click
-**Mở Live**. The Deep-Live-Cam preview opens automatically. The first model
-load may take 10–30 seconds. macOS may ask for camera access.
+Double-click `start.command` to open the original Deep-Live-Cam 2.1.5
+interface, or run `./run_mac.sh` in Terminal. Select the source image and
+camera in that interface, then use its **Live** button. The first model load
+may take 10–30 seconds. macOS may ask for camera access.
 
-The launcher offers **Mac smooth 360p** as the default and an HD 720p option.
-The GPEN options run every third live frame to reduce model load, but may still
+The Mac profile starts at 640×360 and keeps the preview window resizable. The
+GPEN options run every third live frame to reduce model load, but may still
 reduce frame rate or make skin look too smooth. See [PROFILES.md](PROFILES.md)
 for mask, blend, and Windows GPU controls. The swap model changes the face area;
-it does not replace hairstyle or
-hair silhouette. For better results, use a sharp source portrait in similar
-lighting and keep the webcam face well lit.
+it does not replace hairstyle or hair silhouette. For better results, use a
+sharp source portrait in similar lighting and keep the webcam face well lit.
 
-The original `run.sh` is still available if you prefer the full Deep-Live-Cam
-interface: `./run.sh` opens the image chooser in `source_faces/`, while
-`./run.sh /absolute/path/to/faces` uses another folder.
+The original `run.sh` is also available if you prefer the upstream source
+folder chooser: `./run.sh` opens the standard Deep-Live-Cam interface.
 
 ## OBS on macOS
 
