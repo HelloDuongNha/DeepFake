@@ -17,6 +17,19 @@ sharp source portrait in similar lighting and keep the webcam face well lit.
 The original `run.sh` is also available if you prefer the upstream source
 folder chooser: `./run.sh` opens the standard Deep-Live-Cam interface.
 
+For the sharpest local result, choose **GPEN-512** or **GFPGAN** in the
+original Face Enhancer control. The Mac preset leaves enhancement off for
+speed; you can enable a cached GPEN pass from Terminal with:
+
+```sh
+DLC_ENHANCER=GPEN-512 DLC_ENHANCER_INTERVAL=3 DLC_DETAIL_STRENGTH=0.35 ./run_mac.sh
+```
+
+`DLC_DETAIL_STRENGTH` restores fine camera texture after enhancement, while
+`DLC_MASK_BLUR=1.5`, `DLC_MASK_EROSION=4`, and `DLC_HAIRLINE_GUARD=0.16` are
+the default edge and hairline safeguards. See [PROFILES.md](PROFILES.md) for
+the full tuning table.
+
 ## OBS on macOS
 
 1. Leave the Deep-Live-Cam preview window open.
@@ -49,13 +62,21 @@ use the following exact names and destinations:
 | Face analysis: `genderage.onnx` | https://huggingface.co/hacksider/deep-live-cam/resolve/main/buffalo_l/buffalo_l/genderage.onnx | `models/buffalo_l/genderage.onnx` |
 | Face analysis: `w600k_r50.onnx` | https://huggingface.co/hacksider/deep-live-cam/resolve/main/buffalo_l/buffalo_l/w600k_r50.onnx | `models/buffalo_l/w600k_r50.onnx` |
 | Optional face enhancement: `gfpgan-1024.onnx` | https://huggingface.co/hacksider/deep-live-cam/resolve/main/gfpgan-1024.onnx | `models/gfpgan-1024.onnx` |
+| Optional face enhancement: `GPEN-BFR-256.onnx` | https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/GPEN-BFR/GPEN-BFR-256.onnx | `models/GPEN-BFR-256.onnx` |
+| Optional face enhancement: `GPEN-BFR-512.onnx` | https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/GPEN-BFR/GPEN-BFR-512.onnx | `models/GPEN-BFR-512.onnx` |
 | Optional alternate face swap: `inswapper_128_fp16.onnx` | https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx | `models/inswapper_128_fp16.onnx` |
 
-All six required files above were downloaded and verified against the sizes
-expected by the project's model downloader. The README also links
+The six core files (the swap model plus the five `buffalo_l` files) are
+verified against the sizes expected by the project's model downloader. The README also links
 `inswapper_128_fp16.onnx`, but the current Apple Silicon swapper
 selects `inswapper_128.onnx` first. The FP16 model is an alternative when the
 FP32 model is absent.
+
+The current hair protection uses the InsightFace 106-point landmark model
+(`models/buffalo_l/buffalo_l/2d106det.onnx`) when those landmarks are available,
+plus a fast aligned-space guard for live five-point detection. No separate
+`bisenet.onnx` file is required by this profile; adding a second parser would
+cost another inference pass on the M-series GPU/Neural Engine.
 
 ## Environment
 

@@ -18,6 +18,7 @@ from modules.utilities import (
 from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
 from modules.platform_info import OPENVINO_PROVIDER_CONFIG
+from modules.processors.frame.face_masking import create_hairline_safe_mask
 import os
 from collections import deque
 import time
@@ -303,7 +304,8 @@ def _get_soft_alpha(size: int) -> np.ndarray:
     """
     erosion = modules.globals.mask_erosion
     blur = modules.globals.mask_blur
-    key = (size, erosion, blur)
+    hairline_guard = float(getattr(modules.globals, "hairline_guard", 0.16))
+    key = (size, erosion, blur, hairline_guard)
     if _paste_cache['alpha_key'] != key:
         # Elliptical (not square) template. A full/eroded square leaves the aligned
         # crop's corners near-opaque, so the swapped square's straight edges
@@ -318,6 +320,21 @@ def _get_soft_alpha(size: int) -> np.ndarray:
                 cv2.MORPH_ELLIPSE, (erosion * 2 + 1, erosion * 2 + 1)
             )
             mask = cv2.erode(mask, kernel)
+        # Keep the real hairline out of the generic aligned-face mask.  In
+        # live mode the fast detector supplies five landmarks, so loading a
+        # separate hair parser for every frame would cost more FPS than it
+        # saves.  A shallow curved guard is stable under affine warping and
+        # still leaves the forehead skin below the hairline available for the
+        # swap.
+        if hairline_guard > 0.0:
+            boundary = max(0.0, min(0.35, hairline_guard)) * size
+            yy = np.arange(size, dtype=np.float32)[:, None]
+            xx = np.arange(size, dtype=np.float32)[None, :]
+            half = max(1.0, size * 0.44)
+            curve = boundary + (0.035 * size) * np.square((xx - size * 0.5) / half)
+            feather = max(1.0, blur * 1.5)
+            gate = np.clip((yy - curve + feather) / (2.0 * feather), 0.0, 1.0)
+            mask = np.rint(mask.astype(np.float32) * gate).astype(np.uint8)
         if blur:
             kernel_size = max(3, int(np.ceil(blur * 3)) * 2 + 1)
             mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), blur)
@@ -430,7 +447,13 @@ def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarr
         return cg['io_binding'].get_outputs()[0].numpy()
 
 
-def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
+def _fast_paste_back(
+    target_img: Frame,
+    bgr_fake: np.ndarray,
+    aimg: np.ndarray,
+    M: np.ndarray,
+    target_face: Face | None = None,
+) -> Frame:
     """Paste bgr_fake back onto target_img via the inverse affine of M.
 
     Restricts work to the face bbox in output coordinates and warps a
@@ -474,6 +497,20 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
         flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
     )
     alpha_crop = cv2.warpAffine(soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0)
+
+    # If the detector supplied 106 landmarks, apply the precise skin mask as
+    # an additional guard.  The generic aligned-space curve above remains the
+    # fallback for the faster five-point live detector.
+    if target_face is not None and getattr(target_face, "landmark_2d_106", None) is not None:
+        try:
+            skin_mask = create_hairline_safe_mask(target_face, target_img)
+            if skin_mask.shape[:2] == target_img.shape[:2]:
+                alpha_crop = np.minimum(
+                    alpha_crop, skin_mask[y1p:y2p, x1p:x2p]
+                ).astype(np.uint8)
+        except Exception:
+            # A malformed optional landmark set must never disable swapping.
+            pass
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
 
@@ -554,7 +591,9 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
 
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        swapped_frame = _fast_paste_back(
+            temp_frame, bgr_fake, _aimg_dummy, M, target_face=target_face
+        )
 
     except Exception as e:
         print(f"Error during face swap: {e}")

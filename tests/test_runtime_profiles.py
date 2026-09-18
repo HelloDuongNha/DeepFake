@@ -102,6 +102,22 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(len(inference_calls), 1)
         self.assertEqual(positions, [1.0, 2.0, 3.0])
 
+    def test_detail_blend_restores_camera_texture_without_changing_shape(self):
+        restored = np.full((32, 32, 3), 120, dtype=np.uint8)
+        camera = restored.copy()
+        camera[16, 16] = (255, 255, 255)
+        blended = enhancer.blend_high_frequency(camera, restored, strength=1.0)
+        self.assertEqual(blended.shape, restored.shape)
+        self.assertGreater(int(blended[16, 16, 0]), int(restored[16, 16, 0]))
+        self.assertTrue(np.all(blended <= 255))
+
+    def test_hairline_guard_excludes_upper_aligned_rows(self):
+        with patch.object(settings, "hairline_guard", 0.16), \
+             patch.object(settings, "mask_blur", 1.5):
+            mask = enhancer.apply_hairline_guard(np.full((128, 128), 255, dtype=np.uint8))
+        self.assertEqual(int(mask[0, 64]), 0)
+        self.assertGreater(int(mask[64, 64]), 240)
+
 
 if __name__ == "__main__":
     unittest.main()

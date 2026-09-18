@@ -72,6 +72,71 @@ def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
 
     return mask
 
+
+def create_hairline_safe_mask(
+    face: Face,
+    frame: Frame,
+    blur_sigma: float | None = None,
+    erosion_px: int | None = None,
+) -> np.ndarray:
+    """Return a tight facial-skin mask that excludes the hairline.
+
+    InsightFace's optional 106-point landmarks are used when available.  The
+    face outline is eroded and its upper edge is clipped to a smooth curve
+    derived from the eyebrows and chin.  This keeps the real hair and sideburn
+    pixels from being replaced, while leaving the forehead skin below the
+    natural hairline available to the swap.  The fast five-point live path has
+    a separate aligned-space guard in ``face_swapper``; this function provides
+    a more precise mask whenever 106 landmarks are present.
+    """
+    if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+        return np.zeros((0, 0), dtype=np.uint8)
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    landmarks = getattr(face, "landmark_2d_106", None)
+    if landmarks is None:
+        return mask
+    landmarks = np.asarray(landmarks, dtype=np.float32)
+    if landmarks.shape[0] < 106 or not np.all(np.isfinite(landmarks)):
+        return mask
+
+    outline = landmarks[:33].astype(np.int32)
+    hull = cv2.convexHull(outline)
+    if hull is None or len(hull) < 3:
+        return mask
+    cv2.fillConvexPoly(mask, hull, 255)
+
+    # Approximate the natural hairline from the brow/chin geometry.  Keeping
+    # the curve below the brow by 42% of the brow-to-chin distance avoids the
+    # overly aggressive forehead extension used by the old mask.
+    brow_points = np.concatenate((landmarks[33:43], landmarks[43:52]))
+    brow_y = float(np.min(brow_points[:, 1]))
+    chin_y = float(landmarks[16, 1])
+    face_width = max(1.0, float(np.ptp(outline[:, 0])))
+    guard_y = brow_y - 0.42 * max(0.0, chin_y - brow_y)
+    yy = np.arange(mask.shape[0], dtype=np.float32)[:, None]
+    xx = np.arange(mask.shape[1], dtype=np.float32)[None, :]
+    center_x = float(np.mean(outline[:, 0]))
+    half_width = max(1.0, face_width * 0.5)
+    curve = guard_y + 0.035 * face_width * np.square((xx - center_x) / half_width)
+    sigma = float(modules.globals.mask_blur if blur_sigma is None else blur_sigma)
+    feather = max(1.0, sigma * 1.5)
+    gate = np.clip((yy - curve + feather) / (2.0 * feather), 0.0, 1.0)
+    mask = np.rint(mask.astype(np.float32) * gate).astype(np.uint8)
+
+    erosion = int(modules.globals.mask_erosion if erosion_px is None else erosion_px)
+    # Scale the aligned-space setting to the current frame's face width.
+    scaled_erosion = max(0, int(round(erosion * face_width / 128.0)))
+    if scaled_erosion:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (scaled_erosion * 2 + 1, scaled_erosion * 2 + 1),
+        )
+        mask = cv2.erode(mask, kernel)
+    if sigma > 0:
+        kernel_size = max(3, int(np.ceil(sigma * 3)) * 2 + 1)
+        mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), sigma)
+    return mask
+
 def create_lower_mouth_mask(
     face: Face, frame: Frame
 ) -> (np.ndarray, np.ndarray, tuple, np.ndarray):

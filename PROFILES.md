@@ -59,11 +59,31 @@ Set these environment variables before launch to tune the paste-back mask:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DLC_MASK_BLUR` | `3` | Gaussian sigma in the aligned 128 px face crop; smaller means a narrower feather. Range: 0–16. |
-| `DLC_MASK_EROSION` | `3` | Pixels to erode the aligned mask; larger keeps the swapped area farther inside the face. Range: 0–16. |
+| `DLC_MASK_BLUR` | `1.5` | Gaussian sigma in the aligned 128 px face crop; smaller means a narrower feather. Range: 0–16. |
+| `DLC_MASK_EROSION` | `4` | Pixels to erode the aligned mask; larger keeps the swapped area farther inside the face. Range: 0–16. |
+| `DLC_DETAIL_STRENGTH` | `0.35` | High-frequency camera texture mixed back after GPEN/GFPGAN. `0` disables it; `1` is strongest. |
+| `DLC_HAIRLINE_GUARD` | `0.16` | Fraction of the aligned crop protected above the forehead. Increase if hair is being touched; range 0–0.35. |
 | `DLC_BLEND_MODE` | `alpha` on Mac, `poisson` on Windows script | `alpha` is faster; `poisson` uses OpenCV seamlessClone for color-adaptive blending. |
 | `DLC_ENHANCER_INTERVAL` | `3` on Mac, `1` on Windows script | Run an enabled enhancer every N live frames. File processing always runs every frame. |
 
-Start with the defaults. If a dark halo remains, try blur 3 and erosion 3.
-If the mask cuts into the cheeks or forehead, reduce erosion. Poisson can help
-with skin-tone seams but is more expensive and cannot guarantee a perfect match.
+Start with the defaults. If a halo remains, try `DLC_MASK_BLUR=1` and
+`DLC_MASK_EROSION=5`. If the mask cuts into the cheeks, reduce erosion. If
+hair is touched at the forehead, increase `DLC_HAIRLINE_GUARD` to `0.20`.
+Poisson can help with skin-tone seams but is more expensive and cannot
+guarantee a perfect match.
+
+## Detail preservation
+
+GPEN-512 and GFPGAN are loaded from `models/` when selected in the original
+Face Enhancer control. The restoration result is blended with a configurable
+high-frequency residual from the live camera crop, which keeps fine eyebrow
+hairs and expression lines without reintroducing broad blur. For a sharper
+result use `DLC_DETAIL_STRENGTH=0.45`; lower it to `0.15` if the camera is
+noisy. The feature is also applied when an enhancer is cached between live
+frames.
+
+The live five-point detector uses the aligned hairline guard for speed. When
+106-point landmarks are available, `face_masking.create_hairline_safe_mask`
+adds an eyebrow/chin-aware skin mask before paste-back. A separate BiSeNet
+hair parser is intentionally not bundled: it would add another model and
+inference pass on every Mac frame, reducing the smoothness target.

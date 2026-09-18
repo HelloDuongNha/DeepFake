@@ -195,7 +195,11 @@ def _paste_back(
         face_mask_f[-border:, :] *= ramp_down[:, None]
         face_mask_f[:, :border] *= ramp_up[None, :]
         face_mask_f[:, -border:] *= ramp_down[None, :]
-        _enhancer_cache['mask'] = (face_mask_f * 255.0).astype(np.uint8)
+        from modules.processors.frame._onnx_enhancer import apply_hairline_guard
+
+        _enhancer_cache['mask'] = apply_hairline_guard(
+            (face_mask_f * 255.0).astype(np.uint8)
+        )
         _enhancer_cache['mask_size'] = output_size
 
     # Compute tight bbox from affine corners (avoids full-frame warpAffine scan)
@@ -350,10 +354,16 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                 with THREAD_SEMAPHORE:
                     from modules.processors.frame._onnx_enhancer import (
                         run_inference,
+                        blend_high_frequency,
                     )
                     input_tensor = _preprocess_face(aligned_face)
                     output_tensor = run_inference(session, input_name, input_tensor)
                     enhanced_bgr = _postprocess_face(output_tensor)
+                    enhanced_bgr = blend_high_frequency(
+                        aligned_face,
+                        enhanced_bgr,
+                        modules.globals.detail_strength,
+                    )
 
                 eh, ew = enhanced_bgr.shape[:2]
                 if eh != align_size or ew != align_size:
@@ -379,13 +389,20 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
             # Reuse enhanced pixels, but align them to the current face position.
             cached = _enh_live_cache
             if cached['enhanced_bgr'] is not None:
-                _, current_affine = _align_face(
+                current_aligned, current_affine = _align_face(
                     temp_frame, landmarks_5, output_size=cached['align_size']
                 )
-                if current_affine is None:
+                if current_affine is None or current_aligned is None:
                     continue
+                from modules.processors.frame._onnx_enhancer import blend_high_frequency
+
+                cached_face = blend_high_frequency(
+                    current_aligned,
+                    cached['enhanced_bgr'],
+                    modules.globals.detail_strength,
+                )
                 _paste_back(
-                    temp_frame, cached['enhanced_bgr'],
+                    temp_frame, cached_face,
                     current_affine,
                     output_size=cached['align_size'],
                 )

@@ -175,6 +175,55 @@ def postprocess_face(output: np.ndarray) -> np.ndarray:
     return img
 
 
+def blend_high_frequency(
+    camera_crop: np.ndarray,
+    restored_crop: np.ndarray,
+    strength: float | None = None,
+) -> np.ndarray:
+    """Put a controlled amount of camera texture back over a restoration.
+
+    GPEN/GFPGAN deliberately removes sensor noise and can also smooth small
+    features such as eyebrow hairs and expression lines.  We extract only the
+    high-frequency residual (camera minus a 2 px Gaussian low-pass image), so
+    colour and broad facial shape still come from the restoration model.  The
+    residual is clipped before conversion back to uint8 to avoid haloing or
+    wrap-around at bright/dark edges.
+    """
+    if strength is None:
+        strength = modules.globals.detail_strength
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0 or camera_crop is None or restored_crop is None:
+        return restored_crop
+    if camera_crop.shape != restored_crop.shape:
+        camera_crop = cv2.resize(
+            camera_crop,
+            (restored_crop.shape[1], restored_crop.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    camera = camera_crop.astype(np.float32)
+    restored = restored_crop.astype(np.float32)
+    low_frequency = cv2.GaussianBlur(camera, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    high_frequency = camera - low_frequency
+    blended = np.clip(restored + high_frequency * strength, 0.0, 255.0)
+    return blended.astype(np.uint8)
+
+
+def apply_hairline_guard(mask: np.ndarray) -> np.ndarray:
+    """Clip the upper part of an aligned enhancer mask above the hairline."""
+    guard = float(getattr(modules.globals, "hairline_guard", 0.16))
+    if guard <= 0.0 or mask is None or mask.ndim != 2:
+        return mask
+    size = mask.shape[0]
+    boundary = max(0.0, min(0.35, guard)) * size
+    yy = np.arange(size, dtype=np.float32)[:, None]
+    xx = np.arange(mask.shape[1], dtype=np.float32)[None, :]
+    half = max(1.0, size * 0.44)
+    curve = boundary + 0.035 * size * np.square((xx - size * 0.5) / half)
+    feather = max(1.0, float(getattr(modules.globals, "mask_blur", 1.5)) * 1.5)
+    gate = np.clip((yy - curve + feather) / (2.0 * feather), 0.0, 1.0)
+    return np.rint(mask.astype(np.float32) * gate).astype(np.uint8)
+
+
 def _get_face_affine(face: Any, input_size: int):
     """Compute affine transform to align a face to GPEN input space.
 
@@ -238,10 +287,27 @@ def enhance_face_onnx(
             input_name = session.get_inputs()[0].name
             output = run_inference(session, input_name, blob)
         enhanced = postprocess_face(output)
+        # Restore a small amount of the real camera's texture.  This is done
+        # before caching so skipped live frames retain the same detail profile
+        # without another CPU pass.
+        enhanced = blend_high_frequency(
+            face_crop, enhanced, modules.globals.detail_strength
+        )
         if live:
             cache["enhanced"] = enhanced
     else:
         enhanced = cache["enhanced"]
+        # The expensive restoration stays cached, but the inexpensive
+        # high-frequency residual follows the current frame so eyebrows and
+        # expression lines do not look frozen during skipped frames.
+        if live and modules.globals.detail_strength > 0.0:
+            current_crop = cv2.warpAffine(
+                frame, M, (input_size, input_size),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+            enhanced = blend_high_frequency(
+                current_crop, enhanced, modules.globals.detail_strength
+            )
 
     # Create mask for blending (feathered edges)
     mask = np.ones((input_size, input_size), dtype=np.float32)
@@ -250,6 +316,7 @@ def enhance_face_onnx(
     mask[-border:, :] = np.linspace(1, 0, border)[:, np.newaxis]
     mask[:, :border] = np.minimum(mask[:, :border], np.linspace(0, 1, border)[np.newaxis, :])
     mask[:, -border:] = np.minimum(mask[:, -border:], np.linspace(1, 0, border)[np.newaxis, :])
+    mask = apply_hairline_guard(np.rint(mask * 255.0).astype(np.uint8)).astype(np.float32) / 255.0
 
     h, w = frame.shape[:2]
     warped_enhanced = cv2.warpAffine(

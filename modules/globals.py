@@ -47,9 +47,28 @@ keep_frames: bool = False
 many_faces: bool = False         # Process all detected faces with default source
 map_faces: bool = False          # Use source_target_map or simple_map for specific swaps
 poisson_blend: bool = os.environ.get("DLC_BLEND_MODE", "alpha").lower() == "poisson"
-mask_blur: float = _env_float("DLC_MASK_BLUR", 3.0, 0.0, 16.0)
-mask_erosion: int = _env_int("DLC_MASK_EROSION", 3, 0, 16)
+# A narrow feather plus a small inward erosion avoids the grey halo that the
+# old 3 px/3 px defaults left around the jaw and forehead.  Both values stay
+# configurable so a difficult camera or a different crop can be tuned without
+# changing code.
+mask_blur: float = _env_float("DLC_MASK_BLUR", 1.5, 0.0, 16.0)
+mask_erosion: int = _env_int("DLC_MASK_EROSION", 4, 0, 16)
 enhancer_interval: int = _env_int("DLC_ENHANCER_INTERVAL", 1, 1, 6)
+# Amount of high-frequency texture copied from the camera crop after GPEN or
+# GFPGAN.  0 keeps the restoration output untouched; 1 fully restores the
+# camera's fine detail.  A moderate default keeps eyebrows and wrinkles while
+# avoiding visible camera noise.
+detail_strength: float = _env_float(
+    "DLC_DETAIL_STRENGTH",
+    _env_float("DLC_ENHANCER_FIDELITY", 0.35, 0.0, 1.0),
+    0.0,
+    1.0,
+)
+# Fraction of the aligned crop above the forehead that is kept out of the
+# generic paste-back mask.  The live detector normally exposes only five
+# landmarks, so this lightweight guard protects real hair without running a
+# second segmentation model on every frame.
+hairline_guard: float = _env_float("DLC_HAIRLINE_GUARD", 0.16, 0.0, 0.35)
 color_correction: bool = False   # Enable color correction (implementation specific)
 nsfw_filter: bool = False
 
