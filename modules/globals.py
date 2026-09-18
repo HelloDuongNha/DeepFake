@@ -47,6 +47,9 @@ keep_frames: bool = False
 many_faces: bool = False         # Process all detected faces with default source
 map_faces: bool = False          # Use source_target_map or simple_map for specific swaps
 poisson_blend: bool = os.environ.get("DLC_BLEND_MODE", "alpha").lower() == "poisson"
+color_match: bool = os.environ.get("DLC_COLOR_MATCH", "1").lower() not in {
+    "0", "false", "off", "no"
+}
 # A narrow feather plus a small inward erosion avoids the grey halo that the
 # old 3 px/3 px defaults left around the jaw and forehead.  Both values stay
 # configurable so a difficult camera or a different crop can be tuned without
@@ -64,6 +67,7 @@ detail_strength: float = _env_float(
     0.0,
     1.0,
 )
+film_grain_strength: float = _env_float("DLC_FILM_GRAIN", 0.35, 0.0, 1.0)
 # Fraction of the aligned crop above the forehead that is kept out of the
 # generic paste-back mask.  The live detector normally exposes only five
 # landmarks, so this lightweight guard protects real hair without running a

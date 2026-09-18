@@ -9,6 +9,7 @@ import modules.globals as settings
 from modules.processors.frame import face_swapper
 from modules.processors.frame import _onnx_enhancer as enhancer
 from modules.processors.frame import face_enhancer as gfpgan
+from modules.processors.frame import face_masking
 
 
 class RuntimeProfileTests(unittest.TestCase):
@@ -117,6 +118,40 @@ class RuntimeProfileTests(unittest.TestCase):
             mask = enhancer.apply_hairline_guard(np.full((128, 128), 255, dtype=np.uint8))
         self.assertEqual(int(mask[0, 64]), 0)
         self.assertGreater(int(mask[64, 64]), 240)
+
+    def test_mouth_slider_does_not_touch_eye_rows(self):
+        landmarks = np.zeros((106, 2), dtype=np.float32)
+        left_eye = np.column_stack((np.linspace(48, 72, 10), np.full(10, 48)))
+        right_eye = np.column_stack((np.linspace(128, 152, 10), np.full(10, 48)))
+        mouth = np.column_stack((np.linspace(78, 122, 12), np.full(12, 132)))
+        landmarks[33:43] = left_eye
+        landmarks[87:97] = right_eye
+        landmarks[52:64] = mouth
+        face = SimpleNamespace(landmark_2d_106=landmarks)
+        frame = np.zeros((200, 200, 3), dtype=np.uint8)
+        with patch.object(settings, "mouth_mask_size", 100.0):
+            mouth_mask, _, mouth_box, _ = face_masking.create_lower_mouth_mask(face, frame)
+        eye_mask, _, eye_box, _ = face_masking.create_eyes_mask(face, frame)
+        self.assertGreater(mouth_box[1], eye_box[3])
+        self.assertEqual(int(np.count_nonzero(mouth_mask[:90])), 0)
+        self.assertEqual(int(np.count_nonzero(eye_mask[90:])), 0)
+
+    def test_adaptive_film_grain_adds_subtle_texture(self):
+        camera = np.full((32, 32, 3), 120, dtype=np.uint8)
+        restored = camera.copy()
+        grain = enhancer.add_adaptive_film_grain(camera, restored, strength=0.5)
+        self.assertEqual(grain.shape, restored.shape)
+        self.assertGreater(float(np.std(grain.astype(np.int16))), 0.1)
+
+    def test_masked_lab_color_match_changes_only_face_roi(self):
+        source = np.zeros((16, 16, 3), dtype=np.uint8)
+        source[:] = (180, 80, 50)
+        target = np.zeros_like(source)
+        target[:] = (50, 120, 180)
+        mask = np.zeros((16, 16), dtype=np.uint8)
+        mask[4:12, 4:12] = 255
+        corrected = face_masking.match_color_lab(source, target, mask)
+        self.assertGreater(float(np.mean(corrected[4:12, 4:12, 2])), float(np.mean(source[4:12, 4:12, 2])))
 
 
 if __name__ == "__main__":

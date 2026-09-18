@@ -208,6 +208,47 @@ def blend_high_frequency(
     return blended.astype(np.uint8)
 
 
+def add_adaptive_film_grain(
+    camera_crop: np.ndarray,
+    restored_crop: np.ndarray,
+    strength: float | None = None,
+) -> np.ndarray:
+    """Add camera-matched, very fine grain to an enhanced face crop.
+
+    Noise is estimated with a robust MAD statistic on a one-pixel high-pass
+    residual so strong eyebrows or edges do not dominate the measurement.  A
+    small ``cv2.randn`` field is then added to the restored crop.  The output
+    is clipped to avoid coloured wrap-around at 0/255.
+    """
+    if strength is None:
+        strength = modules.globals.film_grain_strength
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0 or camera_crop is None or restored_crop is None:
+        return restored_crop
+    if camera_crop.shape[:2] != restored_crop.shape[:2]:
+        camera_crop = cv2.resize(
+            camera_crop,
+            (restored_crop.shape[1], restored_crop.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    gray = cv2.cvtColor(camera_crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    residual = gray - cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    median = float(np.median(residual))
+    mad = float(np.median(np.abs(residual - median)))
+    measured_std = 1.4826 * mad
+    # Typical webcam ISO grain is only a few 8-bit levels.  Keep a small floor
+    # so an unusually clean synthetic crop still receives natural microtexture.
+    noise_std = float(np.clip(measured_std, 2.0, 4.0)) * strength
+    if noise_std <= 0.0:
+        return restored_crop
+    noise = np.zeros(restored_crop.shape[:2], dtype=np.float32)
+    cv2.randn(noise, 0.0, noise_std)
+    # Luminance grain is shared by the three channels to avoid coloured
+    # speckles that would look like compression artefacts.
+    noise = noise[:, :, None]
+    return np.clip(restored_crop.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
+
+
 def apply_hairline_guard(mask: np.ndarray) -> np.ndarray:
     """Clip the upper part of an aligned enhancer mask above the hairline."""
     guard = float(getattr(modules.globals, "hairline_guard", 0.16))
@@ -293,6 +334,9 @@ def enhance_face_onnx(
         enhanced = blend_high_frequency(
             face_crop, enhanced, modules.globals.detail_strength
         )
+        enhanced = add_adaptive_film_grain(
+            face_crop, enhanced, modules.globals.film_grain_strength
+        )
         if live:
             cache["enhanced"] = enhanced
     else:
@@ -307,6 +351,9 @@ def enhance_face_onnx(
             )
             enhanced = blend_high_frequency(
                 current_crop, enhanced, modules.globals.detail_strength
+            )
+            enhanced = add_adaptive_film_grain(
+                current_crop, enhanced, modules.globals.film_grain_strength
             )
 
     # Create mask for blending (feathered edges)

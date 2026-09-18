@@ -5,32 +5,46 @@ import modules.globals
 from modules.gpu_processing import gpu_gaussian_blur, gpu_resize
 
 def apply_color_transfer(source, target):
+    """Transfer the target's LAB tone to ``source`` (unmasked compatibility API)."""
+    return match_color_lab(source, target)
+
+
+def match_color_lab(
+    source: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Match colour statistics in LAB using only the supplied face mask.
+
+    The masked path avoids sampling background, hair or clothing when a swap
+    is blended.  All channel operations are vectorized NumPy expressions; the
+    tiny face ROI is the only region converted back to BGR.
     """
-    Apply color transfer from target to source image using LAB color space.
-    Uses float32 throughout for performance (sufficient precision for 8-bit images).
-    """
-    # Convert to float32 [0,1] range for proper LAB conversion
-    source_f32 = source.astype(np.float32) / 255.0
-    target_f32 = target.astype(np.float32) / 255.0
-
-    source_lab = cv2.cvtColor(source_f32, cv2.COLOR_BGR2LAB)
-    target_lab = cv2.cvtColor(target_f32, cv2.COLOR_BGR2LAB)
-
-    source_mean, source_std = cv2.meanStdDev(source_lab)
-    target_mean, target_std = cv2.meanStdDev(target_lab)
-
-    # Reshape mean and std to be broadcastable (already float64 from meanStdDev, cast to f32)
-    source_mean = source_mean.reshape(1, 1, 3).astype(np.float32)
-    source_std = np.maximum(source_std.reshape(1, 1, 3), 1e-6).astype(np.float32)
-    target_mean = target_mean.reshape(1, 1, 3).astype(np.float32)
-    target_std = target_std.reshape(1, 1, 3).astype(np.float32)
-
-    # Perform the color transfer in LAB space
-    result_lab = (source_lab - source_mean) * (target_std / source_std) + target_mean
-
-    # Convert back to BGR and uint8
-    result_bgr = cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
-    return np.clip(result_bgr * 255.0, 0, 255).astype(np.uint8)
+    if source is None or target is None or source.size == 0 or target.size == 0:
+        return source
+    if source.shape[:2] != target.shape[:2]:
+        source = cv2.resize(source, (target.shape[1], target.shape[0]), interpolation=cv2.INTER_LINEAR)
+    src = np.asarray(source, dtype=np.uint8)
+    ref = np.asarray(target, dtype=np.uint8)
+    src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    ref_lab = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+    if mask is None:
+        valid = np.ones(src_lab.shape[:2], dtype=bool)
+    else:
+        valid = np.asarray(mask) > 16
+        if valid.shape != src_lab.shape[:2] or int(np.count_nonzero(valid)) < 16:
+            return src
+    src_values = src_lab[valid]
+    ref_values = ref_lab[valid]
+    src_mean = src_values.mean(axis=0, dtype=np.float32)
+    ref_mean = ref_values.mean(axis=0, dtype=np.float32)
+    src_std = np.maximum(src_values.std(axis=0), 1.0)
+    ref_std = ref_values.std(axis=0)
+    # Keep luminance transfer conservative so Poisson still handles local
+    # gradients instead of receiving a globally over-contrasted crop.
+    ref_std = np.maximum(ref_std, 1.0)
+    corrected = (src_lab - src_mean) * (ref_std / src_std) + ref_mean
+    return cv2.cvtColor(np.clip(corrected, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -290,6 +304,122 @@ def create_eyes_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple
         eyes_polygon = np.vstack([left_points, right_points])
         
     return mask, eyes_cutout, (min_x, min_y, max_x, max_y), eyes_polygon
+
+
+# The original routines above are kept for compatibility with old saved UI
+# state.  These definitions are the active implementations: they use disjoint
+# feature groups and are intentionally vectorized so the mouth slider cannot
+# enlarge an ROI over the eyes.
+def _feature_landmarks(face: Face):
+    landmarks = getattr(face, "landmark_2d_106", None)
+    if landmarks is None:
+        landmarks = getattr(face, "landmark_2d_68", None)
+    if landmarks is None:
+        return None, None
+    points = np.asarray(landmarks, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or not np.all(np.isfinite(points)):
+        return None, None
+    if points.shape[0] >= 106:
+        # InsightFace 106 convention. The 68-point fallback below uses the
+        # conventional 48:68 mouth and 36:48 eye ranges.
+        return points[52:64], (points[33:43], points[87:97])
+    if points.shape[0] >= 68:
+        return points[48:68], (points[36:42], points[42:48])
+    return None, None
+
+
+def _mask_blur(mask: np.ndarray) -> np.ndarray:
+    sigma = float(getattr(modules.globals, "mask_blur", 1.5))
+    if sigma <= 0:
+        return mask
+    return cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+
+def create_lower_mouth_mask(
+    face: Face, frame: Frame
+) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
+    """Create a mouth-only mask whose slider cannot reach the eye region."""
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    mouth_cutout = None
+    mouth_polygon = None
+    mouth_box = (0, 0, 0, 0)
+    mouth_points, eye_sets = _feature_landmarks(face)
+    if mouth_points is None:
+        return mask, mouth_cutout, mouth_box, mouth_polygon
+
+    slider = float(np.clip(getattr(modules.globals, "mouth_mask_size", 0.0) / 100.0, 0.0, 1.0))
+    center = mouth_points.mean(axis=0)
+    offsets = mouth_points - center
+    x_scale = 1.0 + 0.65 * slider
+    y_scale = np.where(offsets[:, 1] >= 0.0, 1.0 + 1.8 * slider, 1.0 + 0.2 * slider)
+    expanded = center + offsets * np.column_stack((np.full(len(offsets), x_scale), y_scale))
+
+    # Hard separation from both eyes, including at the maximum slider value.
+    if eye_sets:
+        eye_bottom = max(float(np.max(eye[:, 1])) for eye in eye_sets if len(eye))
+        mouth_height = max(1.0, float(np.ptp(mouth_points[:, 1])))
+        safe_top = eye_bottom + max(2.0, 0.12 * mouth_height)
+        expanded[:, 1] = np.maximum(expanded[:, 1], safe_top)
+
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, frame.shape[1] - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, frame.shape[0] - 1)
+    expanded = np.rint(expanded).astype(np.int32)
+    span = np.ptp(expanded, axis=0)
+    pad_x = max(1, int(round(span[0] * 0.10)))
+    pad_y = max(1, int(round(span[1] * 0.10)))
+    min_x = max(0, int(np.min(expanded[:, 0])) - pad_x)
+    max_x = min(frame.shape[1], int(np.max(expanded[:, 0])) + pad_x + 1)
+    min_y = max(0, int(np.min(expanded[:, 1])) - pad_y)
+    max_y = min(frame.shape[0], int(np.max(expanded[:, 1])) + pad_y + 1)
+    if max_x <= min_x or max_y <= min_y:
+        return mask, mouth_cutout, mouth_box, mouth_polygon
+
+    roi_mask = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
+    cv2.fillPoly(roi_mask, [expanded - np.array([min_x, min_y])], 255)
+    mask[min_y:max_y, min_x:max_x] = _mask_blur(roi_mask)
+    mouth_cutout = frame[min_y:max_y, min_x:max_x].copy()
+    mouth_polygon = expanded
+    return mask, mouth_cutout, (min_x, min_y, max_x, max_y), mouth_polygon
+
+
+def create_eyes_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
+    """Create independent eye ellipses; the mouth slider is never consulted."""
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    eyes_cutout = None
+    eye_polygon = np.empty((0, 2), dtype=np.int32)
+    _, eye_sets = _feature_landmarks(face)
+    if not eye_sets or any(len(eye) == 0 for eye in eye_sets):
+        return mask, eyes_cutout, (0, 0, 0, 0), eye_polygon
+
+    scale = 1.0 + float(getattr(modules.globals, "mask_down_size", 0.1)) * float(
+        getattr(modules.globals, "eyes_mask_size", 0.0)
+    )
+    all_points = np.vstack(eye_sets)
+    mins = np.min(all_points, axis=0)
+    maxs = np.max(all_points, axis=0)
+    padding = max(1, int(round(max(maxs - mins) * 0.20 * scale)))
+    min_x = max(0, int(np.floor(mins[0] - padding)))
+    min_y = max(0, int(np.floor(mins[1] - padding)))
+    max_x = min(frame.shape[1], int(np.ceil(maxs[0] + padding + 1)))
+    max_y = min(frame.shape[0], int(np.ceil(maxs[1] + padding + 1)))
+    if max_x <= min_x or max_y <= min_y:
+        return mask, eyes_cutout, (0, 0, 0, 0), eye_polygon
+
+    yy, xx = np.ogrid[min_y:max_y, min_x:max_x]
+    roi_mask = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
+    polygons = []
+    for eye in eye_sets:
+        center = np.mean(eye, axis=0)
+        axes = np.maximum(1.0, (np.ptp(eye, axis=0) * 0.5) * scale)
+        inside = (((xx - center[0]) / axes[0]) ** 2 + ((yy - center[1]) / axes[1]) ** 2) <= 1.0
+        roi_mask[inside] = 255
+        t = np.linspace(0.0, 2.0 * np.pi, 32, endpoint=False)
+        polygons.append(np.column_stack((center[0] + axes[0] * np.cos(t), center[1] + axes[1] * np.sin(t))))
+    mask[min_y:max_y, min_x:max_x] = _mask_blur(roi_mask)
+    eyes_cutout = frame[min_y:max_y, min_x:max_x].copy()
+    eye_polygon = np.vstack(polygons).astype(np.int32)
+    return mask, eyes_cutout, (min_x, min_y, max_x, max_y), eye_polygon
+
 
 def create_curved_eyebrow(points):
     if len(points) >= 5:

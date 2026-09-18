@@ -28,7 +28,9 @@ DLC_ENHANCER=GPEN-512 DLC_ENHANCER_INTERVAL=3 DLC_DETAIL_STRENGTH=0.35 ./run_mac
 `DLC_DETAIL_STRENGTH` restores fine camera texture after enhancement, while
 `DLC_MASK_BLUR=1.5`, `DLC_MASK_EROSION=4`, and `DLC_HAIRLINE_GUARD=0.16` are
 the default edge and hairline safeguards. See [PROFILES.md](PROFILES.md) for
-the full tuning table.
+the full tuning table. `DLC_FILM_GRAIN=0.35` adds camera-matched microtexture
+after GPEN/GFPGAN; `DLC_COLOR_MATCH=1` applies masked LAB tone matching before
+Poisson when that blend mode is enabled.
 
 ## OBS on macOS
 

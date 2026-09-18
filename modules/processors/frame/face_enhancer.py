@@ -355,6 +355,7 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                     from modules.processors.frame._onnx_enhancer import (
                         run_inference,
                         blend_high_frequency,
+                        add_adaptive_film_grain,
                     )
                     input_tensor = _preprocess_face(aligned_face)
                     output_tensor = run_inference(session, input_name, input_tensor)
@@ -363,6 +364,11 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                         aligned_face,
                         enhanced_bgr,
                         modules.globals.detail_strength,
+                    )
+                    enhanced_bgr = add_adaptive_film_grain(
+                        aligned_face,
+                        enhanced_bgr,
+                        modules.globals.film_grain_strength,
                     )
 
                 eh, ew = enhanced_bgr.shape[:2]
@@ -394,12 +400,20 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                 )
                 if current_affine is None or current_aligned is None:
                     continue
-                from modules.processors.frame._onnx_enhancer import blend_high_frequency
+                from modules.processors.frame._onnx_enhancer import (
+                    blend_high_frequency,
+                    add_adaptive_film_grain,
+                )
 
                 cached_face = blend_high_frequency(
                     current_aligned,
                     cached['enhanced_bgr'],
                     modules.globals.detail_strength,
+                )
+                cached_face = add_adaptive_film_grain(
+                    current_aligned,
+                    cached_face,
+                    modules.globals.film_grain_strength,
                 )
                 _paste_back(
                     temp_frame, cached_face,

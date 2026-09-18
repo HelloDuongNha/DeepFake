@@ -62,7 +62,9 @@ Set these environment variables before launch to tune the paste-back mask:
 | `DLC_MASK_BLUR` | `1.5` | Gaussian sigma in the aligned 128 px face crop; smaller means a narrower feather. Range: 0–16. |
 | `DLC_MASK_EROSION` | `4` | Pixels to erode the aligned mask; larger keeps the swapped area farther inside the face. Range: 0–16. |
 | `DLC_DETAIL_STRENGTH` | `0.35` | High-frequency camera texture mixed back after GPEN/GFPGAN. `0` disables it; `1` is strongest. |
+| `DLC_FILM_GRAIN` | `0.35` | Adaptive fine grain added after enhancement. It measures camera noise and uses a 2–4 level field; `0` disables it. |
 | `DLC_HAIRLINE_GUARD` | `0.16` | Fraction of the aligned crop protected above the forehead. Increase if hair is being touched; range 0–0.35. |
+| `DLC_COLOR_MATCH` | `1` | Match LAB colour statistics inside the face mask before Poisson blending. Set `0` to disable. |
 | `DLC_BLEND_MODE` | `alpha` on Mac, `poisson` on Windows script | `alpha` is faster; `poisson` uses OpenCV seamlessClone for color-adaptive blending. |
 | `DLC_ENHANCER_INTERVAL` | `3` on Mac, `1` on Windows script | Run an enabled enhancer every N live frames. File processing always runs every frame. |
 
@@ -87,3 +89,9 @@ The live five-point detector uses the aligned hairline guard for speed. When
 adds an eyebrow/chin-aware skin mask before paste-back. A separate BiSeNet
 hair parser is intentionally not bundled: it would add another model and
 inference pass on every Mac frame, reducing the smoothness target.
+
+Mouth and eye masks use separate landmark groups. For the InsightFace 106-point
+model the outer mouth is `52:64` and the two eyes are `33:43`/`87:97`; for a
+68-point face they fall back to the conventional `48:68` mouth and `36:48`
+eyes. The mouth slider is clipped below the lowest eye point, so increasing it
+cannot erase the eyes or expand their bounding box.

@@ -18,7 +18,11 @@ from modules.utilities import (
 from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
 from modules.platform_info import OPENVINO_PROVIDER_CONFIG
-from modules.processors.frame.face_masking import create_hairline_safe_mask
+from modules.processors.frame.face_masking import (
+    create_hairline_safe_mask,
+    create_lower_mouth_mask as create_shared_lower_mouth_mask,
+    match_color_lab,
+)
 import os
 from collections import deque
 import time
@@ -89,6 +93,18 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                             mask = np.zeros((h, w), dtype=np.uint8)
                             mask[py1:py2, px1:px2] = bin_roi
                             center = (mx1 + bw // 2, my1 + bh // 2)
+                            if getattr(modules.globals, "color_match", True):
+                                roi_mask = mask[my1:my2 + 1, mx1:mx2 + 1]
+                                source_roi = swapped_frame[my1:my2 + 1, mx1:mx2 + 1]
+                                reference_roi = original_frame[my1:my2 + 1, mx1:mx2 + 1]
+                                corrected = match_color_lab(
+                                    source_roi, reference_roi, roi_mask
+                                )
+                                np.copyto(
+                                    source_roi,
+                                    corrected,
+                                    where=roi_mask[:, :, None] > 16,
+                                )
                             blended = cv2.seamlessClone(swapped_frame, original_frame,
                                                         mask, center, cv2.NORMAL_CLONE)
                             np.copyto(swapped_frame[my1:my2 + 1, mx1:mx2 + 1],
@@ -128,7 +144,6 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                 return swapped_frame
             _poisson_cached_mask = mask
             _poisson_cached_key = mask_key
-        blended = cv2.seamlessClone(swapped_frame, original_frame, mask, center, cv2.NORMAL_CLONE)
         # Composite ONLY this face's ellipse back (ROI-bounded) so previously
         # blended faces in multi-face mode are preserved.
         rx0 = max(0, center_x - radius_x)
@@ -136,6 +151,16 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
         ry0 = max(0, center_y - radius_y)
         ry1 = min(h, center_y + radius_y + 1)
         roi_mask = mask[ry0:ry1, rx0:rx1]
+        if getattr(modules.globals, "color_match", True):
+            source_roi = swapped_frame[ry0:ry1, rx0:rx1]
+            reference_roi = original_frame[ry0:ry1, rx0:rx1]
+            corrected = match_color_lab(source_roi, reference_roi, roi_mask)
+            np.copyto(
+                source_roi,
+                corrected,
+                where=roi_mask[:, :, None] > 16,
+            )
+        blended = cv2.seamlessClone(swapped_frame, original_frame, mask, center, cv2.NORMAL_CLONE)
         np.copyto(swapped_frame[ry0:ry1, rx0:rx1],
                   blended[ry0:ry1, rx0:rx1],
                   where=roi_mask[:, :, None].astype(bool))
@@ -1266,6 +1291,11 @@ def create_lower_mouth_mask(
 
     # Return values, ensuring defaults if errors occurred
     return mask, mouth_cutout, mouth_box, lower_lip_polygon
+
+
+def create_lower_mouth_mask(face: Face, frame: Frame):
+    """Use the shared disjoint mouth/eye geometry for the live swap path."""
+    return create_shared_lower_mouth_mask(face, frame)
 
 
 def draw_mouth_mask_visualization(
