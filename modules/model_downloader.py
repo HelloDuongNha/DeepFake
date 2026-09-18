@@ -164,7 +164,7 @@ def ensure_insightface_pack(name: str = "buffalo_l") -> bool:
     if not members:
         return False
 
-    dest_dir = os.path.join(os.path.expanduser("~"), ".insightface", "models", name)
+    dest_dir = os.path.join(MODELS_DIR, name)
     if all(is_present(member, dest_dir) for member in members):
         return True
 

@@ -91,6 +91,12 @@ PREVIEW_MAX_HEIGHT = 700
 PREVIEW_MAX_WIDTH = 1200
 PREVIEW_DEFAULT_WIDTH = 640
 PREVIEW_DEFAULT_HEIGHT = 360
+# Keep the original compact preview window. Capture resolution is configurable
+# independently through DLC_CAPTURE_WIDTH/HEIGHT, so resizing the window does
+# not force a full-screen-sized widget.
+LIVE_CAPTURE_WIDTH = int(os.environ.get("DLC_CAPTURE_WIDTH", "640"))
+LIVE_CAPTURE_HEIGHT = int(os.environ.get("DLC_CAPTURE_HEIGHT", "360"))
+LIVE_CAPTURE_FPS = int(os.environ.get("DLC_CAPTURE_FPS", "60"))
 
 POPUP_WIDTH = 750
 POPUP_HEIGHT = 810
@@ -233,7 +239,7 @@ def _(text: str) -> str:
 
 
 # Preserve original cwd state for file dialogs.
-_RECENT_SOURCE_DIR: Optional[str] = None
+_RECENT_SOURCE_DIR: Optional[str] = os.environ.get("DLC_SOURCE_DIR")
 _RECENT_TARGET_DIR: Optional[str] = None
 _RECENT_OUTPUT_DIR: Optional[str] = None
 
@@ -262,7 +268,10 @@ def fit_image_to_size(image, width: int, height: int):
     ratio_h = height / h
     ratio = min(ratio_w, ratio_h)
     new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
-    return gpu_resize(image, dsize=new_size)
+    if new_size == (w, h):
+        return image
+    interpolation = cv2.INTER_AREA if ratio < 1 else cv2.INTER_CUBIC
+    return gpu_resize(image, dsize=new_size, interpolation=interpolation)
 
 
 def _bgr_to_qpixmap(bgr: np.ndarray) -> QPixmap:
@@ -600,8 +609,8 @@ class MainWindow(QMainWindow):
                                    "Keep extracted frames on disk after processing")
         self.sw_many_faces = make("many_faces", "Many faces",
                                   "Swap every detected face, not just the primary one")
-        self.sw_poisson = make("poisson_blend", "Poisson Blend",
-                               "Blend face edges smoothly using Poisson blending")
+        self.sw_poisson = make("poisson_blend", "Seamless / Poisson Blend",
+                               "Use seamlessClone for color-adaptive face blending; slower than alpha blending")
         self.sw_color_fix = make("color_correction", "Fix Blueish Cam",
                                  "Fix blue/green color cast from some webcams")
         self.sw_show_fps = make("show_fps", "Show FPS",
@@ -1196,7 +1205,7 @@ class WebcamPreviewWindow(QWidget):
         layout.addWidget(self._image_label, 1)
 
         self._cap = VideoCapturer(camera_index)
-        if not self._cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
+        if not self._cap.start(LIVE_CAPTURE_WIDTH, LIVE_CAPTURE_HEIGHT, LIVE_CAPTURE_FPS):
             update_status("Failed to start camera")
             QTimer.singleShot(0, self.close)
             return
@@ -1543,6 +1552,34 @@ def init(
     _BRIDGE = _UIBridge()
     _MAIN = MainWindow(start, destroy)
     _PREVIEW = PreviewWindow()
+
+    blend_mode = os.environ.get("DLC_BLEND_MODE", "").lower()
+    if blend_mode in {"alpha", "poisson"}:
+        _MAIN.sw_poisson.setChecked(blend_mode == "poisson")
+        modules.globals.poisson_blend = blend_mode == "poisson"
+
+    enhancer = os.environ.get("DLC_ENHANCER")
+    if enhancer in {"None", "GFPGAN", "GPEN-512", "GPEN-256"}:
+        _MAIN.cb_enhancer.setCurrentText(enhancer)
+
+    source_image = os.environ.get("DLC_SOURCE_IMAGE")
+    if source_image and os.path.isfile(source_image) and is_image(source_image):
+        global _RECENT_SOURCE_DIR
+        modules.globals.source_path = source_image
+        _RECENT_SOURCE_DIR = os.path.dirname(source_image)
+        _MAIN.source_label.setPixmap(render_image_preview(source_image, (200, 200)))
+        _MAIN.source_label.setText("")
+
+    camera_index = os.environ.get("DLC_CAMERA_INDEX")
+    if camera_index is not None:
+        try:
+            camera_position = _MAIN._camera_indices.index(int(camera_index))
+            _MAIN.cb_camera.setCurrentIndex(camera_position)
+        except (ValueError, IndexError):
+            pass
+
+    if os.environ.get("DLC_AUTO_LIVE") == "1" and modules.globals.source_path:
+        QTimer.singleShot(0, _MAIN._on_live)
 
     # Route status updates onto the UI thread regardless of caller.
     _BRIDGE.statusChanged.connect(_MAIN.set_status)

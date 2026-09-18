@@ -11,6 +11,7 @@ import platform
 import signal
 import shutil
 import argparse
+import subprocess
 try:
     import torch
     HAS_TORCH = True
@@ -57,7 +58,7 @@ def parse_args() -> None:
     program.add_argument('--live-mirror', help='The live camera display as you see it in the front-facing camera frame', dest='live_mirror', action='store_true', default=False)
     program.add_argument('--live-resizable', help='The live camera frame is resizable', dest='live_resizable', action='store_true', default=False)
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
-    program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
+    program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=['auto'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=None)
     program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')
 
@@ -87,6 +88,7 @@ def parse_args() -> None:
     modules.globals.live_resizable = args.live_resizable
     modules.globals.max_memory = args.max_memory
     modules.globals.execution_providers = decode_execution_providers(args.execution_provider)
+    print(f'[DLC] ONNX providers selected: {modules.globals.execution_providers}')
     modules.globals.execution_threads = args.execution_threads
     modules.globals.lang = args.lang
 
@@ -127,8 +129,13 @@ def encode_execution_providers(execution_providers: List[str]) -> List[str]:
 
 
 def decode_execution_providers(execution_providers: List[str]) -> List[str]:
-    return [provider for provider, encoded_execution_provider in zip(onnxruntime.get_available_providers(), encode_execution_providers(onnxruntime.get_available_providers()))
-            if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
+    available = {name.lower().replace('executionprovider', ''): name
+                 for name in onnxruntime.get_available_providers()}
+    requested = auto_execution_providers() if 'auto' in execution_providers else execution_providers
+    if 'tensorrt' in requested and 'cuda' in available and 'cuda' not in requested:
+        requested = [*requested, 'cuda']
+    selected = [available[name] for name in requested if name in available]
+    return list(dict.fromkeys(selected)) or [available['cpu']]
 
 
 def suggest_max_memory() -> int:
@@ -138,16 +145,39 @@ def suggest_max_memory() -> int:
 
 
 def suggest_default_execution_provider() -> str:
-    """Pick the best available provider: cuda > rocm > coreml > openvino > dml > cpu."""
-    available = encode_execution_providers(onnxruntime.get_available_providers())
-    for pref in ('cuda', 'rocm', 'coreml', 'openvino', 'dml'):
-        if pref in available:
-            return pref
-    return 'cpu'
+    return auto_execution_providers()[0]
+
+
+def has_nvidia_gpu() -> bool:
+    if not shutil.which('nvidia-smi'):
+        return False
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def auto_execution_providers() -> List[str]:
+    available = set(encode_execution_providers(onnxruntime.get_available_providers()))
+    if platform.system() == 'Darwin' and 'coreml' in available:
+        return ['coreml']
+    if platform.system() in ('Windows', 'Linux') and has_nvidia_gpu():
+        if os.environ.get('DLC_PREFER_TENSORRT') == '1' and 'tensorrt' in available:
+            return ['tensorrt', 'cuda'] if 'cuda' in available else ['tensorrt']
+        if 'cuda' in available:
+            return ['cuda']
+    for name in ('rocm', 'openvino', 'dml'):
+        if name in available:
+            return [name]
+    return ['cpu']
 
 
 def suggest_execution_providers() -> List[str]:
-    return encode_execution_providers(onnxruntime.get_available_providers())
+    return ['auto', *encode_execution_providers(onnxruntime.get_available_providers())]
 
 
 def suggest_execution_threads() -> int:

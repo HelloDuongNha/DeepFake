@@ -87,14 +87,14 @@ def get_enhancer() -> Any:
     return ENHANCER
 
 
-def enhance_face(temp_frame: Frame, face: Face) -> Frame:
+def enhance_face(temp_frame: Frame, face: Face, live: bool = False) -> Frame:
     try:
         session = get_enhancer()
     except Exception as e:
         print(f"{NAME}: {e}")
         return temp_frame
     try:
-        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE)
+        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE, live=live)
     except Exception as e:
         print(f"{NAME}: Error during face enhancement: {e}")
         return temp_frame
@@ -107,7 +107,10 @@ def process_frame(source_face: Face | None, temp_frame: Frame, detected_faces=No
         target_face = get_one_face(temp_frame)
     if target_face is None:
         return temp_frame
-    return enhance_face(temp_frame, target_face)
+    return enhance_face(
+        temp_frame, target_face,
+        live=detected_faces is not None and not modules.globals.many_faces,
+    )
 
 
 def process_frame_v2(temp_frame: Frame) -> Frame:

@@ -1,0 +1,4 @@
+# Colab headless UI dependencies. The project runtime dependencies remain in
+# requirements.txt; this file only adds the browser-facing Gradio server.
+-r requirements.txt
+gradio>=5.0,<7

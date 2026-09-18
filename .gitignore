@@ -1,4 +1,5 @@
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.pyc
@@ -14,6 +15,12 @@ tf_env/
 .tmp/
 temp/
 .venv/
+.tools/
+.uv-cache/
+.cache/
+.pytest_cache/
+.gradio/
+*.ipynb_checkpoints/
 venv/
 env/
 workflow/
@@ -21,6 +28,14 @@ gfpgan/
 models/inswapper_128.onnx
 models/GFPGANv1.4.pth
 *.onnx
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx.data
+*.part
+models/
+!models/instructions.txt
 models/DMDNet.pth
 faceswap/
 .vscode/
@@ -29,3 +44,4 @@ switch_states.json
 install.bat
 /.claude
 *.bat
+!run_windows.bat

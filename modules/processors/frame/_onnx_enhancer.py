@@ -20,6 +20,17 @@ IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm6
 
 # Limit concurrent ONNX calls to avoid VRAM exhaustion on multi-face frames
 THREAD_SEMAPHORE = threading.Semaphore(min(max(1, (os.cpu_count() or 1)), 8))
+_LIVE_ENHANCER_CACHE: dict[int, dict] = {}
+
+
+def tensorrt_provider_config():
+    cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))), ".cache", "tensorrt")
+    os.makedirs(cache_dir, exist_ok=True)
+    return ("TensorrtExecutionProvider", {
+        "trt_engine_cache_enable": True,
+        "trt_engine_cache_path": cache_dir,
+    })
 
 
 def build_provider_config(providers=None):
@@ -42,6 +53,8 @@ def build_provider_config(providers=None):
             # EXHAUSTIVE cudnn_conv_algo_search hurt performance on these
             # architectures.
             config.append(p)
+        elif p == "TensorrtExecutionProvider":
+            config.append(tensorrt_provider_config())
         elif p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
             config.append((
                 "CoreMLExecutionProvider",
@@ -203,22 +216,32 @@ def enhance_face_onnx(
     face: Any,
     session: onnxruntime.InferenceSession,
     input_size: int,
+    live: bool = False,
 ) -> np.ndarray:
     """Enhance a single face in the frame using an ONNX face restoration model."""
     M, inv_M = _get_face_affine(face, input_size)
     if M is None:
         return frame
 
-    face_crop = cv2.warpAffine(
-        frame, M, (input_size, input_size),
-        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
-    )
-
-    blob = preprocess_face(face_crop, input_size)
-    with THREAD_SEMAPHORE:
-        input_name = session.get_inputs()[0].name
-        output = run_inference(session, input_name, blob)
-    enhanced = postprocess_face(output)
+    interval = modules.globals.enhancer_interval if live else 1
+    cache = _LIVE_ENHANCER_CACHE.setdefault(id(session), {"count": 0, "enhanced": None})
+    if live:
+        cache["count"] += 1
+    run_model = not live or interval == 1 or cache["enhanced"] is None or (cache["count"] - 1) % interval == 0
+    if run_model:
+        face_crop = cv2.warpAffine(
+            frame, M, (input_size, input_size),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+        )
+        blob = preprocess_face(face_crop, input_size)
+        with THREAD_SEMAPHORE:
+            input_name = session.get_inputs()[0].name
+            output = run_inference(session, input_name, blob)
+        enhanced = postprocess_face(output)
+        if live:
+            cache["enhanced"] = enhanced
+    else:
+        enhanced = cache["enhanced"]
 
     # Create mask for blending (feathered edges)
     mask = np.ones((input_size, input_size), dtype=np.float32)

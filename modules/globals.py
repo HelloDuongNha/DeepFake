@@ -1,7 +1,23 @@
 # --- START OF FILE globals.py ---
 
 import os
+import math
 from typing import List, Dict, Any
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(os.environ.get(name, default))))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+        return max(minimum, min(maximum, value)) if math.isfinite(value) else default
+    except ValueError:
+        return default
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW_DIR = os.path.join(ROOT_DIR, "workflow")
@@ -30,7 +46,10 @@ keep_audio: bool = True
 keep_frames: bool = False
 many_faces: bool = False         # Process all detected faces with default source
 map_faces: bool = False          # Use source_target_map or simple_map for specific swaps
-poisson_blend: bool = False      # Enable Poisson Blending for smoother face swaps
+poisson_blend: bool = os.environ.get("DLC_BLEND_MODE", "alpha").lower() == "poisson"
+mask_blur: float = _env_float("DLC_MASK_BLUR", 3.0, 0.0, 16.0)
+mask_erosion: int = _env_int("DLC_MASK_EROSION", 3, 0, 16)
+enhancer_interval: int = _env_int("DLC_ENHANCER_INTERVAL", 1, 1, 6)
 color_correction: bool = False   # Enable color correction (implementation specific)
 nsfw_filter: bool = False
 

@@ -38,31 +38,8 @@ PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previou
 # (bgr_fake), so the mask is locked exactly to where the swapped face was
 # placed — no independent jitter source, no EMA, no lag. The mask is cached
 # when the face is nearly still so an identical array is reused (zero wobble).
-_ELLIPTICAL_MASK_CACHE: dict = {}
 _poisson_cached_mask: Optional[np.ndarray] = None
 _poisson_cached_key: Optional[tuple] = None
-
-
-def _create_elliptical_mask(size: Tuple[int, int]) -> np.ndarray:
-    """Fixed, heavily-blurred elliptical mask in aligned-face space.
-
-    Geometry-based (not content-adaptive) and cached by size — identical
-    every frame for the same model input size, so it contributes no jitter.
-    """
-    global _ELLIPTICAL_MASK_CACHE
-    if size in _ELLIPTICAL_MASK_CACHE:
-        return _ELLIPTICAL_MASK_CACHE[size]
-    h, w = size
-    center = (w // 2, h // 2)
-    axes = (int(w * 0.44), int(h * 0.44))
-    mask = np.zeros((h, w), dtype=np.float32)
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 1, -1)
-    if h * w < 65536:
-        mask = cv2.GaussianBlur(mask, (31, 31), 12)
-    else:
-        mask = gpu_gaussian_blur(mask, (31, 31), 12)
-    _ELLIPTICAL_MASK_CACHE[size] = mask
-    return mask
 
 
 def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
@@ -97,14 +74,11 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                     roi_aff = inv.copy()
                     roi_aff[0, 2] -= px1
                     roi_aff[1, 2] -= py1
-                    fm = _create_elliptical_mask((fh, fw))
+                    fm = _get_soft_alpha(fh)
                     mroi = cv2.warpAffine(fm, roi_aff, (rw, rh),
                                           flags=cv2.INTER_LINEAR,
                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                    bin_roi = np.where(mroi > 0.5, np.uint8(255), np.uint8(0))
-                    k = max(3, (min(rw, rh) // 20) | 1)
-                    bin_roi = cv2.erode(bin_roi,
-                                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+                    bin_roi = np.where(mroi > 127, np.uint8(255), np.uint8(0))
                     bx, by, bw, bh = cv2.boundingRect(bin_roi)
                     if bw > 0 and bh > 0:
                         mx1, my1 = px1 + bx, py1 + by
@@ -131,15 +105,10 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
         x2, y2 = (min(w, x2), min(h, y2))
         if x2 <= x1 or y2 <= y1 or x2 - x1 <= 10 or (y2 - y1 <= 10):
             return swapped_frame
-        padding = int(min(x2 - x1, y2 - y1) * 0.1)
-        x1_p = max(0, x1 - padding)
-        y1_p = max(0, y1 - padding)
-        x2_p = min(w, x2 + padding)
-        y2_p = min(h, y2 + padding)
         center_x = int(round((x1 + x2) / 2.0))
         center_y = int(round((y1 + y2) / 2.0))
-        radius_x = max(1, int(round((x2_p - x1_p) / 2.0)))
-        radius_y = max(1, int(round((y2_p - y1_p) / 2.0)))
+        radius_x = max(1, int(round((x2 - x1) * 0.44)))
+        radius_y = max(1, int(round((y2 - y1) * 0.44)))
         if not (0 <= center_x < w and 0 <= center_y < h):
             return swapped_frame
         center = (center_x, center_y)
@@ -279,6 +248,11 @@ def get_face_swapper() -> Any:
                         # Use bare provider — ONNX Runtime defaults are
                         # fastest on modern GPUs (Blackwell/sm_120).
                         providers_config.append(p)
+                    elif p == "TensorrtExecutionProvider":
+                        from modules.processors.frame._onnx_enhancer import (
+                            tensorrt_provider_config,
+                        )
+                        providers_config.append(tensorrt_provider_config())
                     elif p == "OpenVINOExecutionProvider":
                         providers_config.append(OPENVINO_PROVIDER_CONFIG)
                     else:
@@ -313,7 +287,7 @@ except ImportError:
 # Cache for paste-back
 _paste_cache = {
     'soft_alpha': None,  # feathered alpha mask in aligned-face space
-    'alpha_size': 0,
+    'alpha_key': None,
 }
 
 
@@ -327,9 +301,11 @@ def _get_soft_alpha(size: int) -> np.ndarray:
     per-frame gives a visually equivalent feather at O(crop_area) cost —
     the feather radius scales naturally with the affine transform.
     """
-    if _paste_cache['alpha_size'] != size:
-        # Elliptical (not square) template — matches the gumroad edition's
-        # _create_elliptical_mask. A full/eroded square leaves the aligned
+    erosion = modules.globals.mask_erosion
+    blur = modules.globals.mask_blur
+    key = (size, erosion, blur)
+    if _paste_cache['alpha_key'] != key:
+        # Elliptical (not square) template. A full/eroded square leaves the aligned
         # crop's corners near-opaque, so the swapped square's straight edges
         # show as a visible box on the face. An ellipse (axes 0.44*size) zeroes
         # the corners and the heavy blur feathers smoothly into the original.
@@ -337,9 +313,16 @@ def _get_soft_alpha(size: int) -> np.ndarray:
         axes = (int(size * 0.44), int(size * 0.44))
         mask = np.zeros((size, size), dtype=np.uint8)
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-        mask = cv2.GaussianBlur(mask, (31, 31), 12)
+        if erosion:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (erosion * 2 + 1, erosion * 2 + 1)
+            )
+            mask = cv2.erode(mask, kernel)
+        if blur:
+            kernel_size = max(3, int(np.ceil(blur * 3)) * 2 + 1)
+            mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), blur)
         _paste_cache['soft_alpha'] = mask  # uint8 [0, 255] — blended via cv2 SIMD ops
-        _paste_cache['alpha_size'] = size
+        _paste_cache['alpha_key'] = key
     return _paste_cache['soft_alpha']
 
 # CUDA graph swap session cache
@@ -486,7 +469,10 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
     crop_w, crop_h = x2p - x1p, y2p - y1p
 
     soft_alpha = _get_soft_alpha(face_h)
-    bgr_fake_crop = cv2.warpAffine(bgr_fake, IM_crop, (crop_w, crop_h), borderMode=cv2.BORDER_REPLICATE)
+    bgr_fake_crop = cv2.warpAffine(
+        bgr_fake, IM_crop, (crop_w, crop_h),
+        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
+    )
     alpha_crop = cv2.warpAffine(soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0)
 
     target_crop = target_img[y1p:y2p, x1p:x2p]

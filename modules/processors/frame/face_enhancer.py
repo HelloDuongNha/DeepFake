@@ -280,7 +280,7 @@ def _postprocess_face(output: np.ndarray) -> np.ndarray:
 
 # Cache for temporal enhancement skipping in live mode.
 # GFPGAN output barely changes between consecutive frames (same face,
-# same position), so we run inference every _ENH_INTERVAL frames and
+# same position), so we run inference every configured interval and
 # reuse the cached enhanced face + affine matrix in between.
 _enh_live_cache: dict = {
     'enhanced_bgr': None,
@@ -288,7 +288,6 @@ _enh_live_cache: dict = {
     'align_size': 0,
     'frame_count': 0,
 }
-_ENH_INTERVAL = 2  # run inference every N frames, paste cached result otherwise
 
 
 def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
@@ -298,7 +297,7 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
         detected_faces: Pre-detected face list. When provided, skips
             the internal detection call (saves ~15-20ms per frame).
             Also enables temporal caching — inference runs every
-            _ENH_INTERVAL frames, reusing the cached result otherwise.
+            configured interval, reusing the cached result otherwise.
     """
     session = get_face_enhancer()
 
@@ -326,7 +325,8 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
     use_cache = detected_faces is not None and not many_faces_mode
     if use_cache:
         _enh_live_cache['frame_count'] += 1
-        run_inference_this_frame = (_enh_live_cache['frame_count'] % _ENH_INTERVAL == 0
+        interval = modules.globals.enhancer_interval
+        run_inference_this_frame = ((_enh_live_cache['frame_count'] - 1) % interval == 0
                                    or _enh_live_cache['enhanced_bgr'] is None)
     else:
         run_inference_this_frame = True
@@ -376,12 +376,17 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                 print(f"{NAME}: Error enhancing a face: {e}")
                 continue
         else:
-            # Reuse cached enhanced face — just paste back onto current frame
+            # Reuse enhanced pixels, but align them to the current face position.
             cached = _enh_live_cache
             if cached['enhanced_bgr'] is not None:
+                _, current_affine = _align_face(
+                    temp_frame, landmarks_5, output_size=cached['align_size']
+                )
+                if current_affine is None:
+                    continue
                 _paste_back(
                     temp_frame, cached['enhanced_bgr'],
-                    cached['affine_matrix'],
+                    current_affine,
                     output_size=cached['align_size'],
                 )
         if not many_faces_mode:
