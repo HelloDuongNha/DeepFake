@@ -12,10 +12,19 @@ if platform.system() == "Windows":
 
 class VideoCapturer:
     def __init__(self, device_index: int):
-        self.device_index = device_index
+        if isinstance(device_index, bool):
+            raise TypeError("Camera device index must be an integer, not bool")
+        try:
+            self.device_index = int(device_index)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise TypeError(
+                f"Camera device index must be an integer, got {device_index!r}"
+            ) from error
         self.frame_callback = None
         self._current_frame = None
+        self._prefetched_frame = None
         self._frame_ready = threading.Event()
+        self._empty_read_count = 0
         self.is_running = False
         self.cap = None
         # Actual values reported by the camera after configuration
@@ -36,6 +45,11 @@ class VideoCapturer:
     def start(self, width: int = 960, height: int = 540, fps: int = 60) -> bool:
         """Initialize and start video capture"""
         try:
+            print(
+                f"[VideoCapturer] Opening device index={self.device_index} "
+                f"platform={platform.system()}",
+                flush=True,
+            )
             if platform.system() == "Windows":
                 # device_index comes from pygrabber.FilterGraph (DirectShow
                 # enumeration), so open with DSHOW first to preserve mapping.
@@ -73,17 +87,34 @@ class VideoCapturer:
                         continue
             elif platform.system() == "Linux":
                 self.cap = cv2.VideoCapture(f"/dev/video{self.device_index}")
+            elif platform.system() == "Darwin":
+                self.cap = cv2.VideoCapture(
+                    int(self.device_index), cv2.CAP_AVFOUNDATION
+                )
             else:
                 self.cap = cv2.VideoCapture(self.device_index)
 
             if not self.cap or not self.cap.isOpened():
-                raise RuntimeError("Failed to open camera")
+                print(
+                    f"[VideoCapturer] cap.isOpened() failed for device "
+                    f"index={self.device_index}",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    f"Failed to open camera index {self.device_index}"
+                )
 
             # Belt-and-braces: also set via cap.set() for backends that honor
             # post-open changes (MSMF, V4L2). DSHOW ignores these, but the
             # construction params above already handled it.
             if platform.system() != "Windows":
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                # AVFoundation chooses the native camera pixel format. Forcing
+                # MJPG can leave built-in FaceTime cameras open but returning
+                # empty frames, which appears as a black preview.
+                if platform.system() != "Darwin":
+                    self.cap.set(
+                        cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG')
+                    )
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
                 self.cap.set(cv2.CAP_PROP_FPS, fps)
@@ -98,6 +129,26 @@ class VideoCapturer:
             reported_fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.actual_fps = self._measure_fps(warmup=10, sample=30,
                                                 fallback=reported_fps or fps)
+
+            if self._prefetched_frame is None:
+                # Some AVFoundation devices open asynchronously. Give the
+                # built-in camera a short grace period before declaring it
+                # unusable.
+                for _ in range(50):
+                    ret, frame = self.cap.read()
+                    if ret and isinstance(frame, np.ndarray) and frame.size > 0:
+                        self._prefetched_frame = frame
+                        break
+                    time.sleep(0.02)
+                if self._prefetched_frame is None:
+                    print(
+                        f"[VideoCapturer] Camera index={self.device_index} opened "
+                        "but returned no valid frame",
+                        flush=True,
+                    )
+                    self.cap.release()
+                    self.cap = None
+                    return False
 
             print(f"[VideoCapturer] {self.actual_width}x{self.actual_height} "
                   f"@ {self.actual_fps:.1f}fps (reported={reported_fps:.0f})",
@@ -114,23 +165,43 @@ class VideoCapturer:
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         """Read a frame from the camera"""
-        if not self.is_running or self.cap is None:
+        if not self.is_running:
             return False, None
 
+        if self.cap is None:
+            return False, None
+
+        if self._prefetched_frame is not None:
+            frame = self._prefetched_frame
+            self._prefetched_frame = None
+            self._current_frame = frame
+            return True, frame
+
         ret, frame = self.cap.read()
-        if ret:
+        if ret and isinstance(frame, np.ndarray) and frame.size > 0:
+            self._empty_read_count = 0
             self._current_frame = frame
             if self.frame_callback:
                 self.frame_callback(frame)
             return True, frame
+        self._log_empty_read()
         return False, None
 
     def release(self) -> None:
         """Stop capture and release resources"""
-        if self.is_running and self.cap is not None:
+        self.is_running = False
+        if self.cap is not None:
             self.cap.release()
-            self.is_running = False
             self.cap = None
+
+    def _log_empty_read(self) -> None:
+        self._empty_read_count += 1
+        if self._empty_read_count == 1 or self._empty_read_count % 30 == 0:
+            print(
+                f"[VideoCapturer] Empty frame from camera index="
+                f"{self.device_index} (count={self._empty_read_count})",
+                flush=True,
+            )
 
     def _measure_fps(self, warmup: int = 10, sample: int = 30,
                      fallback: float = 30.0) -> float:
@@ -142,16 +213,20 @@ class VideoCapturer:
         """
         try:
             for _ in range(warmup):
-                self.cap.read()
+                ret, frame = self.cap.read()
+                if ret and isinstance(frame, np.ndarray) and frame.size > 0:
+                    self._prefetched_frame = frame
             t0 = time.perf_counter()
+            valid_frames = 0
             for _ in range(sample):
-                ret, _ = self.cap.read()
-                if not ret:
-                    return fallback
+                ret, frame = self.cap.read()
+                if ret and isinstance(frame, np.ndarray) and frame.size > 0:
+                    valid_frames += 1
+                    self._prefetched_frame = frame
             elapsed = time.perf_counter() - t0
-            if elapsed <= 0:
+            if elapsed <= 0 or valid_frames == 0:
                 return fallback
-            return sample / elapsed
+            return valid_frames / elapsed
         except Exception:
             return fallback
 

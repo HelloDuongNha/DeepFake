@@ -47,6 +47,7 @@ keep_frames: bool = False
 many_faces: bool = False         # Process all detected faces with default source
 map_faces: bool = False          # Use source_target_map or simple_map for specific swaps
 poisson_blend: bool = os.environ.get("DLC_BLEND_MODE", "alpha").lower() == "poisson"
+poisson_max_lab_distance: float = _env_float("DLC_POISSON_MAX_LAB_DISTANCE", 32.0, 5.0, 100.0)
 color_match: bool = os.environ.get("DLC_COLOR_MATCH", "1").lower() not in {
     "0", "false", "off", "no"
 }

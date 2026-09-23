@@ -4,20 +4,29 @@
 
 Run `./run_mac.sh` or double-click `start.command` to open the original
 Deep-Live-Cam interface. The Mac profile requests 640×360 at 60 fps, CoreML,
-alpha blending, and no enhancer by default. This is a speed preset, not a
+alpha blending, and GPEN-256 on every frame by default. This is a balanced preset, not a
 guaranteed output frame rate. The actual camera mode and processing FPS depend
 on hardware.
 
-To try GPEN-256 every third frame from Terminal:
+To disable GPEN-256 if the machine cannot sustain the desired frame rate:
 
 ```sh
-DLC_ENHANCER=GPEN-256 DLC_ENHANCER_INTERVAL=3 ./run_mac.sh
+DLC_ENHANCER=None ./run_mac.sh
 ```
 
-GPEN/GFPGAN can be selected in the Face Enhancer control. A cached enhanced
-face is aligned to the current face position on skipped frames, so the entire
-camera frame is never frozen. If FPS is still low, leave Face Enhancer set to
-None and keep the 640×360 capture profile.
+GPEN/GFPGAN can be selected in the Face Enhancer control. GPEN-256 runs on
+every live frame; its last restored crop is used only after a transient model
+failure. GPEN-512/GFPGAN can still cache when configured with a longer
+interval. If FPS is low, leave Face Enhancer set to None and keep the 640×360
+capture profile.
+
+The Mac script enables the 19-class parser in
+`models/face_parsing_resnet18.onnx` while keeping GPEN-256. It excludes hair,
+ears, neck and background from the pasted face. The outer 15% on each side
+of the source portrait is removed with a strict radial mask before identity
+extraction. Paste-back uses a separate 18% lateral cheek erosion. No yaw threshold disables
+the swap; brief detector misses use optical-flow tracking of the last face.
+Face parsing adds another inference pass and can lower FPS.
 
 ## Windows NVIDIA
 
@@ -63,10 +72,14 @@ Set these environment variables before launch to tune the paste-back mask:
 | `DLC_MASK_EROSION` | `4` | Pixels to erode the aligned mask; larger keeps the swapped area farther inside the face. Range: 0–16. |
 | `DLC_DETAIL_STRENGTH` | `0.35` | High-frequency camera texture mixed back after GPEN/GFPGAN. `0` disables it; `1` is strongest. |
 | `DLC_FILM_GRAIN` | `0.35` | Adaptive fine grain added after enhancement. It measures camera noise and uses a 2–4 level field; `0` disables it. |
-| `DLC_HAIRLINE_GUARD` | `0.16` | Fraction of the aligned crop protected above the forehead. Increase if hair is being touched; range 0–0.35. |
-| `DLC_COLOR_MATCH` | `1` | Match LAB colour statistics inside the face mask before Poisson blending. Set `0` to disable. |
+| `DLC_HAIRLINE_GUARD` | `0.16` | Forehead guard used by the legacy GFPGAN paste-back path; GPEN uses its complete aligned crop. |
+| `DLC_HAIR_PARSING` | `1` in `run_mac.sh` | Run the ONNX parser as a subtractive hair-only guard. Other labels cannot punch holes in the face. |
+| `DLC_HAIR_PARSER_MODEL` | `models/face_parsing_resnet18.onnx` | Override the parser model path. |
+| `DLC_DET_THRESHOLD` | `0.40` | Face detector confidence threshold. The lower default helps retain small, distant webcam faces. |
+| `DLC_COLOR_MATCH` | `1` | Match LAB colour statistics in the aligned enhancer crop and before Poisson blending. Set `0` to disable. |
 | `DLC_BLEND_MODE` | `alpha` on Mac, `poisson` on Windows script | `alpha` is faster; `poisson` uses OpenCV seamlessClone for color-adaptive blending. |
-| `DLC_ENHANCER_INTERVAL` | `3` on Mac, `1` on Windows script | Run an enabled enhancer every N live frames. File processing always runs every frame. |
+| `DLC_ENHANCER_INTERVAL` | `1` on Mac and Windows | Run GPEN-512/GFPGAN every N live frames if changed. GPEN-256 always runs on each live frame to prevent alternating appearance. |
+| `DLC_POISSON_MAX_LAB_DISTANCE` | `32` | If average LAB face colour differs more than this, use alpha blending for that frame. |
 
 Start with the defaults. If a halo remains, try `DLC_MASK_BLUR=1` and
 `DLC_MASK_EROSION=5`. If the mask cuts into the cheeks, reduce erosion. If
@@ -84,11 +97,10 @@ result use `DLC_DETAIL_STRENGTH=0.45`; lower it to `0.15` if the camera is
 noisy. The feature is also applied when an enhancer is cached between live
 frames.
 
-The live five-point detector uses the aligned hairline guard for speed. When
-106-point landmarks are available, `face_masking.create_hairline_safe_mask`
-adds an eyebrow/chin-aware skin mask before paste-back. A separate BiSeNet
-hair parser is intentionally not bundled: it would add another model and
-inference pass on every Mac frame, reducing the smoothness target.
+The live five-point detector uses the aligned hairline guard. When 106-point
+landmarks are available, `face_masking.create_hairline_safe_mask` adds an
+eyebrow/chin-aware skin mask. The parser model lives in the ignored `models/`
+directory and is loaded when the main Mac script runs.
 
 Mouth and eye masks use separate landmark groups. For the InsightFace 106-point
 model the outer mouth is `52:64` and the two eyes are `33:43`/`87:97`; for a

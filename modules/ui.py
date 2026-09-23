@@ -24,6 +24,10 @@ import cv2
 import numpy as np
 import requests
 from PIL import Image, ImageOps
+from modules.processors.frame.face_masking import (
+    TemporalLandmarkSmoother, is_plausible_face_geometry,
+    track_face_landmarks,
+)
 from PySide6.QtCore import (
     QObject,
     QThread,
@@ -58,8 +62,10 @@ from modules.face_analyser import (
     add_blank_map,
     detect_many_faces_fast,
     detect_one_face_fast,
+    detect_one_face_near,
     ensure_landmarks,
     get_one_face,
+    get_source_face,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
     has_valid_map,
@@ -416,7 +422,18 @@ def check_and_ignore_nsfw(target, destroy: Optional[Callable] = None) -> bool:
     return False
 
 
-# ─── camera enumeration (unchanged from tk version) ──────────────────────
+# ─── camera enumeration ─────────────────────────────────────────
+
+
+def selected_camera_index(combo: QComboBox) -> Optional[int]:
+    """Return only the integer device id stored behind a camera label."""
+    value = combo.currentData(Qt.ItemDataRole.UserRole)
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def get_available_cameras() -> Tuple[List[int], List[str]]:
@@ -730,7 +747,12 @@ class MainWindow(QMainWindow):
             self.cb_camera.setEnabled(False)
             cam_ok = False
         else:
-            self.cb_camera.addItems(self._camera_names)
+            for camera_index, camera_name in zip(
+                self._camera_indices, self._camera_names
+            ):
+                self.cb_camera.addItem(camera_name, int(camera_index))
+            if platform.system() == "Darwin" and self.cb_camera.count() > 1:
+                self.cb_camera.setCurrentIndex(1)
             cam_ok = True
         self.cb_camera.setToolTip(_("Select which camera to use for live mode"))
         layout.addWidget(self.cb_camera, 1)
@@ -933,11 +955,15 @@ class MainWindow(QMainWindow):
             _PREVIEW.show()
 
     def _on_live(self) -> None:
-        idx = self.cb_camera.currentIndex()
-        if idx < 0 or idx >= len(self._camera_indices):
+        camera_index = selected_camera_index(self.cb_camera)
+        if camera_index is None:
             update_status("No camera available")
             return
-        camera_index = self._camera_indices[idx]
+        print(
+            f"[webcam] Selected device index={camera_index} "
+            f"name={self.cb_camera.currentText()!r}",
+            flush=True,
+        )
         if _LIVE_MAPPER is not None and _LIVE_MAPPER.isVisible():
             update_status("Source x Target Mapper is already open.")
             _LIVE_MAPPER.raise_()
@@ -1010,7 +1036,7 @@ class PreviewWindow(QWidget):
         from modules.processors.frame.core import get_frame_processors_modules as _gfpm
         for fp in _gfpm(modules.globals.frame_processors):
             temp_frame = fp.process_frame(
-                get_one_face(imread_unicode(modules.globals.source_path)), temp_frame
+                get_source_face(imread_unicode(modules.globals.source_path)), temp_frame
             )
         # Fit to current widget size while preserving aspect ratio.
         h, w = temp_frame.shape[:2]
@@ -1026,8 +1052,31 @@ class PreviewWindow(QWidget):
 # ─── webcam preview window ───────────────────────────────────────────────
 
 
+def _is_valid_camera_frame(frame) -> bool:
+    return (
+        isinstance(frame, np.ndarray)
+        and frame.ndim == 3
+        and frame.shape[2] >= 3
+        and frame.size > 0
+        and frame.shape[0] > 0
+        and frame.shape[1] > 0
+    )
+
+
+def _frame_or_camera_fallback(candidate, camera_frame, stage: str):
+    if _is_valid_camera_frame(candidate):
+        return candidate
+    print(
+        f"[webcam] {stage} returned an empty frame; showing raw camera frame",
+        flush=True,
+    )
+    return camera_frame
+
+
 class _CaptureWorker(QThread):
     """Reads frames from the camera into a bounded queue. Drops on overflow."""
+
+    rawFrame = Signal(object)
 
     def __init__(self, cap, capture_queue: queue.Queue, stop_event: threading.Event):
         super().__init__()
@@ -1036,11 +1085,25 @@ class _CaptureWorker(QThread):
         self._stop = stop_event
 
     def run(self) -> None:
+        consecutive_failures = 0
         while not self._stop.is_set():
             ret, frame = self._cap.read()
-            if not ret:
-                self._stop.set()
-                break
+            if not ret or not _is_valid_camera_frame(frame):
+                consecutive_failures += 1
+                if consecutive_failures == 1 or consecutive_failures % 30 == 0:
+                    print(
+                        f"[webcam] Camera read returned an empty frame "
+                        f"(consecutive={consecutive_failures})",
+                        flush=True,
+                    )
+                if consecutive_failures >= 150:
+                    print("[webcam] Camera stopped after repeated empty frames", flush=True)
+                    self._stop.set()
+                    break
+                self.msleep(20)
+                continue
+            consecutive_failures = 0
+            self.rawFrame.emit(frame)
             try:
                 self._queue.put_nowait(frame)
             except queue.Full:
@@ -1063,8 +1126,35 @@ class _ProcessingWorker(QThread):
         self._pq = processed_queue
         self._stop = stop_event
         self._fps = camera_fps
+        self._last_camera_frame = None
 
     def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._run_loop()
+            except Exception as error:
+                # A model failure must not take down the camera thread. Raw
+                # frames continue to be displayed while the pipeline retries.
+                print(
+                    f"[webcam] Processing error; keeping raw preview: {error}",
+                    flush=True,
+                )
+                fallback = self._last_camera_frame
+                if _is_valid_camera_frame(fallback):
+                    try:
+                        self._pq.put_nowait(fallback)
+                    except queue.Full:
+                        try:
+                            self._pq.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._pq.put_nowait(fallback)
+                        except queue.Full:
+                            pass
+                self.msleep(10)
+
+    def _run_loop(self) -> None:
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
         source_image = None
         last_source_path = None
@@ -1075,7 +1165,13 @@ class _ProcessingWorker(QThread):
         det_count = 0
         cached_target_face = None
         cached_many_faces = None
-        det_interval = max(1, round(self._fps * 0.08))
+        # Refresh dense geometry at about 25-30 Hz. The former ~12 Hz cadence
+        # left optical flow carrying fast head turns for too many frames and
+        # made a single bad track visibly stretch the mask.
+        det_interval = max(1, round(self._fps * 0.04))
+        landmark_smoother = TemporalLandmarkSmoother()
+        previous_gray = None
+        tracking_lost = False
 
         while not self._stop.is_set():
             try:
@@ -1083,7 +1179,11 @@ class _ProcessingWorker(QThread):
             except queue.Empty:
                 continue
 
-            temp_frame = frame
+            self._last_camera_frame = frame
+            # Process a copy because face_swapper writes its paste-back in
+            # place. Keep ``frame`` pristine for the raw-camera fallback and
+            # the immediate preview signal.
+            temp_frame = frame.copy()
             if modules.globals.live_mirror:
                 temp_frame = gpu_flip(temp_frame, 1)
 
@@ -1093,16 +1193,88 @@ class _ProcessingWorker(QThread):
                     and modules.globals.source_path != last_source_path
                 ):
                     last_source_path = modules.globals.source_path
-                    source_image = get_one_face(imread_unicode(modules.globals.source_path))
+                    source_image = get_source_face(imread_unicode(modules.globals.source_path))
 
                 det_count += 1
-                if det_count % det_interval == 0:
+                current_gray = None
+                if not modules.globals.many_faces:
+                    current_gray = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2GRAY)
+                fresh_detection = False
+                active_det_interval = det_interval
+                if cached_target_face is not None:
+                    bbox = getattr(cached_target_face, "bbox", None)
+                    if bbox is not None:
+                        bbox = np.asarray(bbox, dtype=np.float32)
+                        if bbox.shape == (4,) and min(bbox[2:] - bbox[:2]) < 96.0:
+                            # Small/distant faces have fewer reliable optical-flow
+                            # pixels, so refresh them from the detector every frame.
+                            active_det_interval = 1
+                if det_count % active_det_interval == 0:
                     if modules.globals.many_faces:
+                        landmark_smoother.reset()
+                        previous_gray = None
                         cached_target_face = None
                         cached_many_faces = detect_many_faces_fast(temp_frame)
                     else:
-                        cached_target_face = detect_one_face_fast(temp_frame)
+                        detected = detect_one_face_fast(temp_frame)
+                        if (detected is not None
+                                and not is_plausible_face_geometry(detected)):
+                            detected = None
                         cached_many_faces = None
+                        if detected is not None:
+                            # The final cheek mask uses the stable 106-point
+                            # outline. Computing it on detector frames also
+                            # keeps mouth opening and head turns represented
+                            # directly instead of freezing an old contour.
+                            ensure_landmarks(temp_frame, [detected])
+                            # After LK has failed, accept the new detector
+                            # geometry as a clean reacquisition. Feeding a
+                            # stale pre-motion face back into the smoother can
+                            # otherwise keep the mask detached indefinitely.
+                            if tracking_lost:
+                                landmark_smoother.reset()
+                                reference_face = None
+                            else:
+                                reference_face = cached_target_face
+                            if reference_face is not None and previous_gray is not None:
+                                track_face_landmarks(previous_gray, current_gray, reference_face)
+                            cached_target_face = landmark_smoother.update(
+                                detected, time.monotonic(), reference_face=reference_face
+                            )
+                            tracking_lost = False
+                            fresh_detection = True
+                        # On a temporary miss, keep the last face and let
+                        # optical flow carry it. Never drop the swap merely
+                        # because yaw, a yawn or distance hid landmarks for a
+                        # detector cycle.
+
+                if (cached_target_face is not None and not fresh_detection
+                        and current_gray is not None and previous_gray is not None):
+                    tracked = track_face_landmarks(
+                        previous_gray, current_gray, cached_target_face
+                    )
+                    if not tracked:
+                        tracking_lost = True
+                        # Pitch or a fast turn can temporarily invalidate LK.
+                        # Reacquire in this frame instead of displaying a stale
+                        # transform or waiting for the next detector cadence.
+                        emergency_face = detect_one_face_fast(temp_frame)
+                        if emergency_face is None:
+                            emergency_face = detect_one_face_near(
+                                temp_frame, cached_target_face
+                            )
+                        if (emergency_face is not None
+                                and not is_plausible_face_geometry(emergency_face)):
+                            emergency_face = None
+                        if emergency_face is not None:
+                            ensure_landmarks(temp_frame, [emergency_face])
+                            landmark_smoother.reset()
+                            cached_target_face = landmark_smoother.update(
+                                emergency_face, time.monotonic(),
+                                reference_face=None,
+                            )
+                            tracking_lost = False
+                previous_gray = current_gray
 
                 cached_faces = None
                 if cached_many_faces:
@@ -1166,6 +1338,10 @@ class _ProcessingWorker(QThread):
                     else:
                         temp_frame = fp.process_frame_v2(temp_frame)
 
+            temp_frame = _frame_or_camera_fallback(
+                temp_frame, frame, "processing pipeline"
+            )
+
             current_time = time.time()
             frame_count += 1
             if current_time - prev_time >= fps_update_interval:
@@ -1204,7 +1380,13 @@ class WebcamPreviewWindow(QWidget):
         self._image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self._image_label, 1)
 
-        self._cap = VideoCapturer(camera_index)
+        self._has_processed_frame = False
+        self._stop_event = threading.Event()
+        self._capture_worker = None
+        self._processing_worker = None
+        self._timer = None
+
+        self._cap = VideoCapturer(int(camera_index))
         if not self._cap.start(LIVE_CAPTURE_WIDTH, LIVE_CAPTURE_HEIGHT, LIVE_CAPTURE_FPS):
             update_status("Failed to start camera")
             QTimer.singleShot(0, self.close)
@@ -1218,11 +1400,11 @@ class WebcamPreviewWindow(QWidget):
 
         self._capture_queue: queue.Queue = queue.Queue(maxsize=2)
         self._processed_queue: queue.Queue = queue.Queue(maxsize=2)
-        self._stop_event = threading.Event()
 
         self._capture_worker = _CaptureWorker(
             self._cap, self._capture_queue, self._stop_event
         )
+        self._capture_worker.rawFrame.connect(self._show_raw_frame)
         self._processing_worker = _ProcessingWorker(
             self._capture_queue, self._processed_queue, self._stop_event, camera_fps
         )
@@ -1235,6 +1417,14 @@ class WebcamPreviewWindow(QWidget):
         self._timer.timeout.connect(self._tick)
         self._timer.start(poll_ms)
 
+    def _show_raw_frame(self, bgr_frame) -> None:
+        """Display the camera before the first AI-processed frame is ready."""
+        if self._has_processed_frame or not _is_valid_camera_frame(bgr_frame):
+            return
+        fitted = fit_image_to_size(bgr_frame, self.width(), self.height())
+        if _is_valid_camera_frame(fitted):
+            self._image_label.setPixmap(_bgr_to_qpixmap(fitted))
+
     def _tick(self) -> None:
         if self._stop_event.is_set():
             self.close()
@@ -1243,16 +1433,25 @@ class WebcamPreviewWindow(QWidget):
             bgr_frame = self._processed_queue.get_nowait()
         except queue.Empty:
             return
+        if not _is_valid_camera_frame(bgr_frame):
+            print("[webcam] Ignoring empty processed preview frame", flush=True)
+            return
         bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
+        if not _is_valid_camera_frame(bgr_frame):
+            return
         self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
+        self._has_processed_frame = True
 
     def closeEvent(self, event) -> None:
         self._stop_event.set()
         try:
-            self._timer.stop()
+            if self._timer is not None:
+                self._timer.stop()
         except Exception:
             pass
         for worker in (self._capture_worker, self._processing_worker):
+            if worker is None:
+                continue
             try:
                 worker.wait(2000)
             except Exception:
@@ -1557,8 +1756,19 @@ def init(
     if blend_mode in {"alpha", "poisson"}:
         _MAIN.sw_poisson.setChecked(blend_mode == "poisson")
         modules.globals.poisson_blend = blend_mode == "poisson"
+    if os.environ.get("DLC_DISABLE_POISSON", "0").lower() in {
+        "1", "true", "on", "yes"
+    }:
+        _MAIN.sw_poisson.setChecked(False)
+        _MAIN.sw_poisson.setEnabled(False)
+        _MAIN.sw_poisson.setToolTip(
+            _("Disabled in the current profile to prevent live color flicker")
+        )
+        modules.globals.poisson_blend = False
 
-    enhancer = os.environ.get("DLC_ENHANCER")
+    enhancer = os.environ.get(
+        "DLC_ENHANCER", "GPEN-256" if platform.system() == "Darwin" and platform.machine() == "arm64" else None
+    )
     if enhancer in {"None", "GFPGAN", "GPEN-512", "GPEN-256"}:
         _MAIN.cb_enhancer.setCurrentText(enhancer)
 

@@ -3,6 +3,7 @@ import shutil
 from typing import Any
 import insightface
 import threading
+import numpy as np
 
 import modules.globals
 from modules import imread_unicode, imwrite_unicode
@@ -16,6 +17,7 @@ FACE_ANALYSER = None
 FACE_ANALYSER_LOCK = threading.Lock()
 
 DET_SIZE = (640, 640)
+DET_THRESHOLD = min(0.9, max(0.1, float(os.environ.get("DLC_DET_THRESHOLD", "0.40"))))
 
 
 def get_face_analyser() -> Any:
@@ -34,14 +36,32 @@ def get_face_analyser() -> Any:
 
                 ensure_insightface_pack('buffalo_l')
                 providers = build_provider_config()
-                FACE_ANALYSER = insightface.app.FaceAnalysis(
-                    name='buffalo_l',
-                    root=ROOT_DIR,
-                    providers=providers,
-                    allowed_modules=['detection', 'recognition', 'landmark_2d_106']
+                try:
+                    FACE_ANALYSER = insightface.app.FaceAnalysis(
+                        name='buffalo_l', root=ROOT_DIR, providers=providers,
+                        allowed_modules=['detection', 'recognition', 'landmark_2d_106']
+                    )
+                except Exception as error:
+                    if not any((p[0] if isinstance(p, tuple) else p) == "CoreMLExecutionProvider"
+                               for p in providers):
+                        raise
+                    print(f"[DLC] CoreML face analysis unavailable; using CPU detector: {error}")
+                    providers = ["CPUExecutionProvider"]
+                    FACE_ANALYSER = insightface.app.FaceAnalysis(
+                        name='buffalo_l', root=ROOT_DIR, providers=providers,
+                        allowed_modules=['detection', 'recognition', 'landmark_2d_106']
+                    )
+                # A slightly lower threshold keeps small, distant webcam faces
+                # detectable without changing the 640px detector input size.
+                FACE_ANALYSER.prepare(
+                    ctx_id=0, det_thresh=DET_THRESHOLD, det_size=DET_SIZE
                 )
-                FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
-                _optimize_det_model(FACE_ANALYSER, providers)
+                if any((p[0] if isinstance(p, tuple) else p) == "CoreMLExecutionProvider"
+                       for p in providers):
+                    try:
+                        _optimize_det_model(FACE_ANALYSER, providers)
+                    except Exception as error:
+                        print(f"[DLC] CoreML detector optimization skipped: {error}")
     return FACE_ANALYSER
 
 
@@ -155,6 +175,13 @@ def get_one_face(frame: Frame, faces: Any = None) -> Any:
         return None
 
 
+def get_source_face(frame: Frame) -> Any:
+    """Extract identity and landmarks from the original source portrait."""
+    if frame is None:
+        return None
+    return get_one_face(frame)
+
+
 def get_many_faces(frame: Frame) -> Any:
     try:
         if _is_dml():
@@ -178,6 +205,57 @@ def detect_one_face_fast(frame: Frame) -> Any:
         return None
     idx = int(bboxes[:, 0].argmin())
     return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+
+
+def detect_one_face_near(frame: Frame, reference_face: Any) -> Any:
+    """Retry detection on an expanded last-known ROI for hard expressions.
+
+    Cropping makes the face substantially larger at the detector's fixed
+    640px input without weakening the global threshold or changing tracking
+    geometry. Returned coordinates are mapped back to the camera frame.
+    """
+    if frame is None or reference_face is None:
+        return None
+    bbox = getattr(reference_face, "bbox", None)
+    if bbox is None:
+        return None
+    bbox = np.asarray(bbox, dtype=np.float32).reshape(-1)
+    if bbox.size < 4 or not np.all(np.isfinite(bbox[:4])):
+        return None
+    x1, y1, x2, y2 = bbox[:4]
+    width, height = float(x2 - x1), float(y2 - y1)
+    if width < 12.0 or height < 12.0:
+        return None
+    frame_h, frame_w = frame.shape[:2]
+    left = max(0, int(np.floor(x1 - 0.80 * width)))
+    right = min(frame_w, int(np.ceil(x2 + 0.80 * width)))
+    top = max(0, int(np.floor(y1 - 0.85 * height)))
+    bottom = min(frame_h, int(np.ceil(y2 + 0.75 * height)))
+    if right - left < 24 or bottom - top < 24:
+        return None
+    crop = frame[top:bottom, left:right]
+    fa = get_face_analyser()
+    bboxes, kpss = fa.det_model.detect(crop, max_num=0, metric="default")
+    if bboxes.shape[0] == 0:
+        return None
+    expected = np.array(
+        [((x1 + x2) * 0.5) - left, ((y1 + y2) * 0.5) - top],
+        dtype=np.float32,
+    )
+    centers = (bboxes[:, :2] + bboxes[:, 2:4]) * 0.5
+    idx = int(np.argmin(np.linalg.norm(centers - expected, axis=1)))
+    from insightface.app.common import Face
+    recovered_bbox = bboxes[idx, :4].astype(np.float32).copy()
+    recovered_bbox[[0, 2]] += left
+    recovered_bbox[[1, 3]] += top
+    recovered_kps = kpss[idx].astype(np.float32).copy()
+    recovered_kps[:, 0] += left
+    recovered_kps[:, 1] += top
+    return Face(
+        bbox=recovered_bbox,
+        kps=recovered_kps,
+        det_score=bboxes[idx, 4],
+    )
 
 
 def detect_many_faces_fast(frame: Frame) -> Any:

@@ -174,6 +174,7 @@ def _paste_back(
     enhanced_face: np.ndarray,
     affine_matrix: np.ndarray,
     output_size: int,
+    face: Face | None = None,
 ) -> Frame:
     """
     Paste an enhanced (aligned) face back onto the original frame using the
@@ -201,6 +202,16 @@ def _paste_back(
             (face_mask_f * 255.0).astype(np.uint8)
         )
         _enhancer_cache['mask_size'] = output_size
+
+    if getattr(modules.globals, "color_match", True):
+        from modules.processors.frame.face_masking import match_color_lab
+        reference_face = cv2.warpAffine(
+            frame, affine_matrix, (output_size, output_size),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+        )
+        enhanced_face = match_color_lab(
+            enhanced_face, reference_face, _enhancer_cache['mask']
+        )
 
     # Compute tight bbox from affine corners (avoids full-frame warpAffine scan)
     corners = np.array([[0, 0], [output_size, 0],
@@ -233,6 +244,13 @@ def _paste_back(
         _enhancer_cache['mask'], inv_crop, (crop_w, crop_h),
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+    if face is not None:
+        from modules.processors.frame.face_parser import parse_face_skin, skin_guard_for_crop
+        parsed_skin = parse_face_skin(frame, face)
+        if parsed_skin is not None:
+            inv_mask_crop = np.minimum(
+                inv_mask_crop, skin_guard_for_crop(parsed_skin, x1p, y1p, x2p, y2p)
+            )
 
     target_crop = frame[y1p:y2p, x1p:x2p]
 
@@ -360,16 +378,6 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                     input_tensor = _preprocess_face(aligned_face)
                     output_tensor = run_inference(session, input_name, input_tensor)
                     enhanced_bgr = _postprocess_face(output_tensor)
-                    enhanced_bgr = blend_high_frequency(
-                        aligned_face,
-                        enhanced_bgr,
-                        modules.globals.detail_strength,
-                    )
-                    enhanced_bgr = add_adaptive_film_grain(
-                        aligned_face,
-                        enhanced_bgr,
-                        modules.globals.film_grain_strength,
-                    )
 
                 eh, ew = enhanced_bgr.shape[:2]
                 if eh != align_size or ew != align_size:
@@ -385,8 +393,15 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                     _enh_live_cache['affine_matrix'] = affine_matrix
                     _enh_live_cache['align_size'] = align_size
 
+                detailed_face = blend_high_frequency(
+                    aligned_face, enhanced_bgr, modules.globals.detail_strength
+                )
+                detailed_face = add_adaptive_film_grain(
+                    aligned_face, detailed_face, modules.globals.film_grain_strength
+                )
                 _paste_back(
-                    temp_frame, enhanced_bgr, affine_matrix, output_size=align_size
+                    temp_frame, detailed_face, affine_matrix, output_size=align_size,
+                    face=face,
                 )
             except Exception as e:
                 print(f"{NAME}: Error enhancing a face: {e}")
@@ -418,7 +433,7 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                 _paste_back(
                     temp_frame, cached_face,
                     current_affine,
-                    output_size=cached['align_size'],
+                    output_size=cached['align_size'], face=face,
                 )
         if not many_faces_mode:
             break  # single-face live mode — only process first face

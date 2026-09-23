@@ -9,7 +9,7 @@ import modules.globals
 import modules.processors.frame.core
 from modules import imread_unicode, imwrite_unicode
 from modules.core import update_status
-from modules.face_analyser import get_one_face, get_many_faces, default_source_face
+from modules.face_analyser import get_one_face, get_many_faces, get_source_face, default_source_face
 from modules.typing import Face, Frame
 from modules.utilities import (
     is_image,
@@ -19,10 +19,14 @@ from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
 from modules.platform_info import OPENVINO_PROVIDER_CONFIG
 from modules.processors.frame.face_masking import (
-    create_hairline_safe_mask,
+    create_bbox_safety_mask,
     create_lower_mouth_mask as create_shared_lower_mouth_mask,
     match_color_lab,
+    match_skin_tone_lab,
+    harmonize_mask_boundary,
+    create_eyebrow_protection_mask,
 )
+from modules.processors.frame.face_parser import parse_face_skin, skin_guard_for_crop
 import os
 from collections import deque
 import time
@@ -64,9 +68,55 @@ def _lower_cheek_reference_mask(face_mask: np.ndarray) -> np.ndarray:
     return band * 255
 
 
+def _safe_seamless_clone(swapped: Frame, original: Frame, mask: np.ndarray,
+                         center: tuple[int, int], bounds: tuple[int, int, int, int]) -> Frame:
+    """Use Poisson only when the mask and colour difference are well behaved.
+
+    ``swapped`` is the already-composited alpha result. Never modify it until
+    seamlessClone has passed both checks, so every failure returns exactly
+    the stable alpha frame rather than a partially colour-corrected frame.
+    """
+    x1, y1, x2, y2 = bounds  # exclusive right/bottom
+    h, w = swapped.shape[:2]
+    if x1 < 3 or y1 < 3 or x2 > w - 3 or y2 > h - 3:
+        return swapped
+    region_mask = mask[y1:y2, x1:x2] > 127
+    if np.count_nonzero(region_mask) < 64:
+        return swapped
+    source_roi = swapped[y1:y2, x1:x2]
+    target_roi = original[y1:y2, x1:x2]
+    source_lab = cv2.cvtColor(source_roi, cv2.COLOR_BGR2LAB)
+    target_lab = cv2.cvtColor(target_roi, cv2.COLOR_BGR2LAB)
+    color_delta = np.linalg.norm(
+        source_lab[region_mask].mean(axis=0) - target_lab[region_mask].mean(axis=0)
+    )
+    if color_delta > modules.globals.poisson_max_lab_distance:
+        return swapped
+
+    clone_source = swapped.copy()
+    if getattr(modules.globals, "color_match", True):
+        corrected = match_color_lab(
+            source_roi, target_roi, mask[y1:y2, x1:x2],
+            _lower_cheek_reference_mask(mask[y1:y2, x1:x2]),
+        )
+        np.copyto(clone_source[y1:y2, x1:x2], corrected,
+                  where=region_mask[:, :, None])
+    try:
+        blended = cv2.seamlessClone(clone_source, original, mask, center, cv2.NORMAL_CLONE)
+    except cv2.error:
+        return swapped
+    blended_roi = blended[y1:y2, x1:x2]
+    change = np.abs(blended_roi.astype(np.int16) - source_roi.astype(np.int16))
+    if float(np.mean(change[region_mask])) > 42.0:
+        return swapped
+    np.copyto(source_roi, blended_roi, where=region_mask[:, :, None])
+    return swapped
+
+
 def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                          target_face: Face, affine_matrix: np.ndarray = None,
-                         bgr_fake: np.ndarray = None) -> Frame:
+                         bgr_fake: np.ndarray = None,
+                         parsed_skin=None) -> Frame:
     """Poisson-blend the swapped face onto the original frame.
 
     Preferred path derives the blend mask from the swap's inverse affine so
@@ -100,40 +150,29 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                     mroi = cv2.warpAffine(fm, roi_aff, (rw, rh),
                                           flags=cv2.INTER_LINEAR,
                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    if parsed_skin is not None:
+                        mroi = np.minimum(mroi, skin_guard_for_crop(parsed_skin, px1, py1, px2, py2))
                     bin_roi = np.where(mroi > 127, np.uint8(255), np.uint8(0))
                     bx, by, bw, bh = cv2.boundingRect(bin_roi)
                     if bw > 0 and bh > 0:
                         mx1, my1 = px1 + bx, py1 + by
                         mx2, my2 = mx1 + bw - 1, my1 + bh - 1
-                        # seamlessClone needs the cloned region off the border
-                        if mx1 > 0 and my1 > 0 and mx2 < w - 1 and my2 < h - 1:
-                            mask = np.zeros((h, w), dtype=np.uint8)
-                            mask[py1:py2, px1:px2] = bin_roi
-                            center = (mx1 + bw // 2, my1 + bh // 2)
-                            if getattr(modules.globals, "color_match", True):
-                                roi_mask = mask[my1:my2 + 1, mx1:mx2 + 1]
-                                source_roi = swapped_frame[my1:my2 + 1, mx1:mx2 + 1]
-                                reference_roi = original_frame[my1:my2 + 1, mx1:mx2 + 1]
-                                corrected = match_color_lab(
-                                    source_roi,
-                                    reference_roi,
-                                    roi_mask,
-                                    _lower_cheek_reference_mask(roi_mask),
-                                )
-                                np.copyto(
-                                    source_roi,
-                                    corrected,
-                                    where=roi_mask[:, :, None] > 16,
-                                )
-                            blended = cv2.seamlessClone(swapped_frame, original_frame,
-                                                        mask, center, cv2.NORMAL_CLONE)
-                            np.copyto(swapped_frame[my1:my2 + 1, mx1:mx2 + 1],
-                                      blended[my1:my2 + 1, mx1:mx2 + 1],
-                                      where=mask[my1:my2 + 1, mx1:mx2 + 1, None].astype(bool))
-                            return swapped_frame
+                        mask = np.zeros((h, w), dtype=np.uint8)
+                        mask[py1:py2, px1:px2] = bin_roi
+                        center = (mx1 + bw // 2, my1 + bh // 2)
+                        return _safe_seamless_clone(
+                            swapped_frame, original_frame, mask, center,
+                            (mx1, my1, mx2 + 1, my2 + 1),
+                        )
             except Exception:
-                pass  # fall through to the robust bbox-ellipse path below
+                return swapped_frame
+            # If the affine-derived mask is unusable, retain the existing
+            # alpha composite. Switching to a different bbox ellipse for one
+            # frame is a common source of Poisson flicker.
+            return swapped_frame
         # ---- Fallback: bbox-ellipse (defensive, cached when still) ----
+        if parsed_skin is not None:
+            return swapped_frame
         if not hasattr(target_face, 'bbox') or target_face.bbox is None:
             return swapped_frame
         x1, y1, x2, y2 = target_face.bbox.astype(int)
@@ -171,25 +210,10 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
         ry0 = max(0, center_y - radius_y)
         ry1 = min(h, center_y + radius_y + 1)
         roi_mask = mask[ry0:ry1, rx0:rx1]
-        if getattr(modules.globals, "color_match", True):
-            source_roi = swapped_frame[ry0:ry1, rx0:rx1]
-            reference_roi = original_frame[ry0:ry1, rx0:rx1]
-            corrected = match_color_lab(
-                source_roi,
-                reference_roi,
-                roi_mask,
-                _lower_cheek_reference_mask(roi_mask),
-            )
-            np.copyto(
-                source_roi,
-                corrected,
-                where=roi_mask[:, :, None] > 16,
-            )
-        blended = cv2.seamlessClone(swapped_frame, original_frame, mask, center, cv2.NORMAL_CLONE)
-        np.copyto(swapped_frame[ry0:ry1, rx0:rx1],
-                  blended[ry0:ry1, rx0:rx1],
-                  where=roi_mask[:, :, None].astype(bool))
-        return swapped_frame
+        return _safe_seamless_clone(
+            swapped_frame, original_frame, mask, center,
+            (rx0, ry0, rx1, ry1),
+        )
     except Exception:
         return swapped_frame
 
@@ -354,15 +378,13 @@ def _get_soft_alpha(size: int) -> np.ndarray:
     """
     erosion = modules.globals.mask_erosion
     blur = modules.globals.mask_blur
-    hairline_guard = float(getattr(modules.globals, "hairline_guard", 0.16))
-    key = (size, erosion, blur, hairline_guard)
+    key = (size, erosion, blur)
     if _paste_cache['alpha_key'] != key:
-        # Elliptical (not square) template. A full/eroded square leaves the aligned
-        # crop's corners near-opaque, so the swapped square's straight edges
-        # show as a visible box on the face. An ellipse (axes 0.44*size) zeroes
-        # the corners and the heavy blur feathers smoothly into the original.
+        # Wide oval safety envelope. Dense frame-space landmarks still define
+        # the visible border, while this mask guarantees that one malformed
+        # landmark frame can never expose the square aligned crop.
         center = (size // 2, size // 2)
-        axes = (int(size * 0.44), int(size * 0.44))
+        axes = (int(size * 0.49), int(size * 0.50))
         mask = np.zeros((size, size), dtype=np.uint8)
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
         if erosion:
@@ -370,27 +392,174 @@ def _get_soft_alpha(size: int) -> np.ndarray:
                 cv2.MORPH_ELLIPSE, (erosion * 2 + 1, erosion * 2 + 1)
             )
             mask = cv2.erode(mask, kernel)
-        # Keep the real hairline out of the generic aligned-face mask.  In
-        # live mode the fast detector supplies five landmarks, so loading a
-        # separate hair parser for every frame would cost more FPS than it
-        # saves.  A shallow curved guard is stable under affine warping and
-        # still leaves the forehead skin below the hairline available for the
-        # swap.
-        if hairline_guard > 0.0:
-            boundary = max(0.0, min(0.35, hairline_guard)) * size
-            yy = np.arange(size, dtype=np.float32)[:, None]
-            xx = np.arange(size, dtype=np.float32)[None, :]
-            half = max(1.0, size * 0.44)
-            curve = boundary + (0.035 * size) * np.square((xx - size * 0.5) / half)
-            feather = max(1.0, blur * 1.5)
-            gate = np.clip((yy - curve + feather) / (2.0 * feather), 0.0, 1.0)
-            mask = np.rint(mask.astype(np.float32) * gate).astype(np.uint8)
         if blur:
             kernel_size = max(3, int(np.ceil(blur * 3)) * 2 + 1)
             mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), blur)
         _paste_cache['soft_alpha'] = mask  # uint8 [0, 255] — blended via cv2 SIMD ops
         _paste_cache['alpha_key'] = key
     return _paste_cache['soft_alpha']
+
+
+def _clean_lateral_hair_artifacts(
+    generated_face: np.ndarray,
+    protected_features: np.ndarray | None = None,
+    rear_side: int = 0,
+) -> np.ndarray:
+    """Inpaint thin source-hair remnants on the rear temple at strong yaw."""
+    if generated_face is None or not isinstance(generated_face, np.ndarray):
+        return generated_face
+    if generated_face.size == 0:
+        return generated_face
+    height, width = generated_face.shape[:2]
+    generated_lab = cv2.cvtColor(generated_face, cv2.COLOR_BGR2LAB)
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    nx = (xx + 0.5) / max(1.0, float(width))
+    ny = (yy + 0.5) / max(1.0, float(height))
+    edge_distance = np.minimum(nx, 1.0 - nx)
+    lateral = (
+        (edge_distance >= 0.04) & (edge_distance < 0.36)
+        & (ny >= 0.10) & (ny <= 0.76)
+    )
+    # This cleanup is intended only for the occluded/rear temple. Applying it
+    # to both sides on a frontal face can mistake normal pores and highlights
+    # for artifacts and soften the face.
+    if rear_side < 0:
+        lateral &= nx < 0.50
+    elif rear_side > 0:
+        lateral &= nx > 0.50
+
+    # Detect a thin dark mark relative to its immediate neighbourhood. This
+    # black-hat style residual ignores broad lighting/skin-tone changes, so it
+    # can remove the source sideburn curve without smoothing the whole cheek.
+    luminance = generated_lab[:, :, 0]
+    local_size = max(9, int(round(min(height, width) * 0.13)))
+    if local_size % 2 == 0:
+        local_size += 1
+    local_background = cv2.medianBlur(luminance, local_size)
+    median_darkness = (
+        local_background.astype(np.int16) - luminance.astype(np.int16)
+    )
+    horizontal_close = cv2.morphologyEx(
+        luminance,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (local_size, 3)),
+    )
+    blackhat_darkness = (
+        horizontal_close.astype(np.int16) - luminance.astype(np.int16)
+    )
+    local_darkness = np.maximum(median_darkness, blackhat_darkness)
+    # The same source-hair remnant can become white/green after colour matching
+    # or restoration. Detect narrow local luminance and chroma outliers in
+    # addition to dark strokes; component geometry below still rejects broad
+    # lighting gradients and normal skin shading.
+    local_brightness = (
+        luminance.astype(np.int16) - local_background.astype(np.int16)
+    )
+    chroma_outlier = np.zeros_like(luminance, dtype=np.int16)
+    for channel in (1, 2):
+        local_chroma = cv2.medianBlur(generated_lab[:, :, channel], local_size)
+        chroma_outlier = np.maximum(
+            chroma_outlier,
+            np.abs(
+                generated_lab[:, :, channel].astype(np.int16)
+                - local_chroma.astype(np.int16)
+            ),
+        )
+    lateral_artifact = lateral & (
+        (local_darkness >= 5)
+        | (local_brightness >= 7)
+        | (chroma_outlier >= 6)
+    )
+    if (protected_features is not None
+            and np.asarray(protected_features).shape == lateral_artifact.shape):
+        allowed = np.asarray(protected_features) < 128
+        lateral_artifact &= allowed
+
+    # Only inpaint narrow elongated temple streaks. A naturally lit/shadowed
+    # cheek can have a large LAB difference too, but inpainting that broad
+    # component is exactly what produced the one-sided blurred patch on pitch.
+    lateral_mask = lateral_artifact.astype(np.uint8) * 255
+    lateral_mask = cv2.morphologyEx(
+        lateral_mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 7)),
+    )
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (lateral_mask > 0).astype(np.uint8), connectivity=8
+    )
+    stripe_mask = np.zeros_like(lateral_mask)
+    for label in range(1, count):
+        comp_w = int(stats[label, cv2.CC_STAT_WIDTH])
+        comp_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        fill_ratio = area / max(1.0, float(comp_w * comp_h))
+        vertical_stripe = (
+            comp_h >= max(6, int(round(comp_w * 1.25)))
+            and comp_w <= max(6, int(round(width * 0.18)))
+        )
+        diagonal_thin_stripe = (
+            max(comp_w, comp_h) >= max(8, int(round(height * 0.10)))
+            and fill_ratio <= 0.42
+            and min(comp_w, comp_h) <= max(8, int(round(width * 0.20)))
+        )
+        if ((vertical_stripe or diagonal_thin_stripe)
+                and area <= int(height * width * 0.10)):
+            stripe_mask[labels == label] = 255
+
+    artifact_mask = stripe_mask
+    # Slightly widen retained streaks so Telea samples clean neighbouring skin
+    # instead of leaving a dark/blue center line.
+    artifact_mask = cv2.dilate(
+        artifact_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    )
+    if not np.any(artifact_mask):
+        return generated_face
+    inpainted = cv2.inpaint(generated_face, artifact_mask, 2.0, cv2.INPAINT_TELEA)
+    blend = cv2.GaussianBlur(artifact_mask, (5, 5), 0.6).astype(np.float32) / 255.0
+    return np.clip(
+        generated_face.astype(np.float32) * (1.0 - blend[:, :, None])
+        + inpainted.astype(np.float32) * blend[:, :, None],
+        0, 255,
+    ).astype(np.uint8)
+
+
+def _restore_camera_microtexture(
+    generated_face: np.ndarray,
+    camera_face: np.ndarray,
+    strength: float,
+) -> np.ndarray:
+    """Restore camera wrinkles/pores without copying low-frequency identity."""
+    if (generated_face is None or camera_face is None
+            or generated_face.size == 0 or camera_face.size == 0):
+        return generated_face
+    if camera_face.shape != generated_face.shape:
+        camera_face = cv2.resize(
+            camera_face,
+            (generated_face.shape[1], generated_face.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    amount = float(np.clip(strength, 0.0, 0.45))
+    if amount <= 0.0:
+        return generated_face
+    camera = camera_face.astype(np.float32)
+    low = cv2.GaussianBlur(camera, (0, 0), sigmaX=1.6, sigmaY=1.6)
+    detail = np.clip(camera - low, -28.0, 28.0)
+    height, width = generated_face.shape[:2]
+    alpha = _get_soft_alpha(min(height, width)).astype(np.float32) / 255.0
+    if alpha.shape != (height, width):
+        alpha = cv2.resize(alpha, (width, height), interpolation=cv2.INTER_LINEAR)
+    # Do not copy the real hairline into the generated crop. Eyebrows and
+    # forehead wrinkles below this ramp retain their high-frequency detail.
+    ramp = np.clip(
+        (np.arange(height, dtype=np.float32) / max(1.0, height - 1) - 0.14)
+        / 0.10,
+        0.0, 1.0,
+    )[:, None]
+    alpha *= ramp
+    restored = (
+        generated_face.astype(np.float32)
+        + detail * (amount * alpha[:, :, None])
+    )
+    return np.clip(restored, 0, 255).astype(np.uint8)
 
 # CUDA graph swap session cache
 _cuda_graph_session = {
@@ -503,6 +672,8 @@ def _fast_paste_back(
     aimg: np.ndarray,
     M: np.ndarray,
     target_face: Face | None = None,
+    parsed_skin=None,
+    aligned_guard: np.ndarray | None = None,
 ) -> Frame:
     """Paste bgr_fake back onto target_img via the inverse affine of M.
 
@@ -511,6 +682,17 @@ def _fast_paste_back(
     size-scaled erode+blur on the warped mask. Cost is O(crop_area) regardless
     of how much of the frame the face occupies.
     """
+    if (
+        not isinstance(target_img, np.ndarray)
+        or target_img.size == 0
+        or not isinstance(bgr_fake, np.ndarray)
+        or bgr_fake.size == 0
+        or M is None
+        or np.asarray(M).shape != (2, 3)
+        or not np.all(np.isfinite(M))
+    ):
+        print("[face_swapper] Invalid paste-back input; returning camera frame", flush=True)
+        return target_img
     h, w = target_img.shape[:2]
     face_h, face_w = aimg.shape[:2]
     # inswapper's aligned-face space is square (128x128). _get_soft_alpha
@@ -524,6 +706,24 @@ def _fast_paste_back(
         [[0, 0], [face_w, 0], [face_w, face_h], [0, face_h]], dtype=np.float32
     )
     transformed = (IM[:, :2] @ corners.T).T + IM[:, 2]
+    if target_face is not None and getattr(target_face, "bbox", None) is not None:
+        bbox = np.asarray(target_face.bbox, dtype=np.float32).reshape(-1)
+        if bbox.size >= 4 and np.all(np.isfinite(bbox[:4])):
+            box_w = float(bbox[2] - bbox[0])
+            box_h = float(bbox[3] - bbox[1])
+            quad_min = transformed.min(axis=0)
+            quad_max = transformed.max(axis=0)
+            quad_w, quad_h = (quad_max - quad_min).astype(float)
+            box_center = np.array(
+                [(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5]
+            )
+            quad_center = (quad_min + quad_max) * 0.5
+            if (box_w <= 4.0 or box_h <= 4.0
+                    or quad_w < 0.50 * box_w or quad_w > 2.60 * box_w
+                    or quad_h < 0.50 * box_h or quad_h > 2.60 * box_h
+                    or np.linalg.norm(quad_center - box_center)
+                    > 0.70 * max(box_w, box_h)):
+                return target_img
     x1 = int(np.floor(transformed[:, 0].min()))
     x2 = int(np.ceil(transformed[:, 0].max()))
     y1 = int(np.floor(transformed[:, 1].min()))
@@ -542,27 +742,67 @@ def _fast_paste_back(
     crop_w, crop_h = x2p - x1p, y2p - y1p
 
     soft_alpha = _get_soft_alpha(face_h)
+    if (aligned_guard is not None
+            and np.asarray(aligned_guard).shape == soft_alpha.shape):
+        soft_alpha = cv2.multiply(
+            soft_alpha, np.asarray(aligned_guard, dtype=np.uint8),
+            scale=1.0 / 255.0,
+        )
+    if soft_alpha is None or soft_alpha.size == 0 or not np.any(soft_alpha):
+        print("[face_swapper] Empty alpha template; returning camera frame", flush=True)
+        return target_img
     bgr_fake_crop = cv2.warpAffine(
         bgr_fake, IM_crop, (crop_w, crop_h),
         flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
     )
     alpha_crop = cv2.warpAffine(soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0)
 
-    # If the detector supplied 106 landmarks, apply the precise skin mask as
-    # an additional guard.  The generic aligned-space curve above remains the
-    # fallback for the faster five-point live detector.
-    if target_face is not None and getattr(target_face, "landmark_2d_106", None) is not None:
-        try:
-            skin_mask = create_hairline_safe_mask(target_face, target_img)
-            if skin_mask.shape[:2] == target_img.shape[:2]:
-                alpha_crop = np.minimum(
-                    alpha_crop, skin_mask[y1p:y2p, x1p:x2p]
-                ).astype(np.uint8)
-        except Exception:
-            # A malformed optional landmark set must never disable swapping.
-            pass
+    # The smoothed bbox oval is the sole final geometric boundary. A dense
+    # landmark hull changes shape with expression/noise and previously cut
+    # chunks from the face or made the edge shimmer even while sitting still.
+    if target_face is not None:
+        bbox_guard = create_bbox_safety_mask(target_face, target_img)
+        if bbox_guard.shape[:2] == target_img.shape[:2] and np.any(bbox_guard):
+            candidate = np.minimum(
+                alpha_crop, bbox_guard[y1p:y2p, x1p:x2p]
+            ).astype(np.uint8)
+            retained = float(np.sum(candidate, dtype=np.float64)) / max(
+                1.0, float(np.sum(alpha_crop, dtype=np.float64))
+            )
+            if retained < 0.08:
+                # The tracked face and affine no longer agree. Showing the
+                # camera for this frame is safer than ever exposing a square
+                # aligned crop; the UI detector immediately reacquires it.
+                return target_img
+            alpha_crop = candidate
+
+    if parsed_skin is not None:
+        parser_guard = skin_guard_for_crop(
+            parsed_skin, x1p, y1p, x2p, y2p
+        )
+        candidate = np.minimum(alpha_crop, parser_guard).astype(np.uint8)
+        retained = float(np.sum(candidate, dtype=np.float64)) / max(
+            1.0, float(np.sum(alpha_crop, dtype=np.float64))
+        )
+        # Face parsing only removes confidently detected hair. An ROI/model
+        # mismatch must fail open instead of disabling the whole face swap.
+        if retained >= 0.35:
+            alpha_crop = candidate
+
+    if alpha_crop is None or alpha_crop.size == 0 or not np.any(alpha_crop):
+        print("[face_swapper] Empty warped alpha mask; returning camera frame", flush=True)
+        return target_img
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
+    eyebrow_guard = None
+    if target_face is not None:
+        full_guard = create_eyebrow_protection_mask(target_face, target_img)
+        if full_guard.shape == target_img.shape[:2]:
+            eyebrow_guard = full_guard[y1p:y2p, x1p:x2p]
+    bgr_fake_crop = harmonize_mask_boundary(
+        bgr_fake_crop, target_crop, alpha_crop,
+        preserve_mask=eyebrow_guard,
+    )
 
     if _HAS_TORCH_CUDA:
         # Scale alpha to [0, 1] on device — cheaper to upload uint8 than float.
@@ -585,6 +825,13 @@ def _fast_paste_back(
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """Optimized face swapping with better memory management and performance."""
+    if (
+        not isinstance(temp_frame, np.ndarray)
+        or temp_frame.size == 0
+        or temp_frame.ndim != 3
+    ):
+        print("[face_swapper] Empty input frame; skipping swap", flush=True)
+        return temp_frame
     face_swapper = get_face_swapper()
     if face_swapper is None:
         update_status("Face swapper model not loaded or failed to load. Skipping swap.", NAME)
@@ -630,20 +877,45 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                 temp_frame, target_face, source_face, paste_back=False
             )
 
-        if bgr_fake is None:
+        if not isinstance(bgr_fake, np.ndarray) or bgr_fake.size == 0:
+            print("[face_swapper] Model returned an empty face; using camera frame", flush=True)
             return original_frame
 
-        if not isinstance(bgr_fake, np.ndarray):
+        if M is None or np.asarray(M).shape != (2, 3) or not np.all(np.isfinite(M)):
+            print("[face_swapper] Model returned an invalid affine; using camera frame", flush=True)
             return original_frame
 
         # Pass a dummy aimg with correct shape — _fast_paste_back only uses aimg.shape
         # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
+        parsed_skin = parse_face_skin(temp_frame, target_face)
+
+        # Alpha blending does not receive Poisson's implicit colour solve.
+        # Match the generated face to corresponding real cheek skin in aligned
+        # space before paste-back; hair, neck and clothing are never sampled.
+        camera_face_crop = cv2.warpAffine(
+            original_frame, M, (_face_size, _face_size),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+        )
+        if getattr(modules.globals, "color_match", True):
+            aligned_mask = _get_soft_alpha(_face_size)
+            bgr_fake = match_skin_tone_lab(
+                bgr_fake, camera_face_crop, aligned_mask, strength=0.78
+            )
+        bgr_fake = _restore_camera_microtexture(
+            bgr_fake,
+            camera_face_crop,
+            float(getattr(modules.globals, "detail_strength", 0.58)) * 0.62,
+        )
 
         swapped_frame = _fast_paste_back(
-            temp_frame, bgr_fake, _aimg_dummy, M, target_face=target_face
+            temp_frame, bgr_fake, _aimg_dummy, M, target_face=target_face,
+            parsed_skin=parsed_skin,
         )
+        if not isinstance(swapped_frame, np.ndarray) or swapped_frame.size == 0:
+            print("[face_swapper] Paste-back failed; using camera frame", flush=True)
+            return original_frame
 
     except Exception as e:
         print(f"Error during face swap: {e}")
@@ -678,7 +950,8 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # no EMA, no lag. See _apply_poisson_blend.
     if getattr(modules.globals, "poisson_blend", False):
         swapped_frame = _apply_poisson_blend(
-            swapped_frame, original_frame, target_face, M, bgr_fake
+            swapped_frame, original_frame, target_face, M, bgr_fake,
+            parsed_skin=parsed_skin
         )
 
     # Apply opacity blend between the original frame and the swapped frame
@@ -1006,7 +1279,7 @@ def process_frames(
                     # Specific error for file reading failure
                     update_status(f"Error reading source image file {source_path}. Please check the path and file integrity.", NAME)
                 else:
-                    source_face = get_one_face(source_img)
+                    source_face = get_source_face(source_img)
                     if source_face is None:
                         # Specific message for no face detected after successful read
                         update_status(f"Warning: Successfully read source image {source_path}, but no face was detected. Swaps will be skipped.", NAME)
@@ -1132,7 +1405,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
                 if source_img is None:
                     update_status(f"Error: Could not read source image: {source_path}", NAME)
                     return
-                source_face = get_one_face(source_img)
+                source_face = get_source_face(source_img)
                 if not source_face:
                     update_status(f"Error: No face found in source image: {source_path}", NAME)
                     return
