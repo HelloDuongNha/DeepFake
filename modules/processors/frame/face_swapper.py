@@ -264,7 +264,12 @@ def pre_check() -> bool:
         logging.error(f"Failed to create directory {download_directory_path} due to permission error: {e}")
         return False
 
-    from modules.model_downloader import ensure_any
+    from modules.model_downloader import ensure_any, ensure_model
+
+    if modules.globals.swapper_model == "hyperswap_256":
+        if ensure_model("hyperswap_1a_256.onnx") is not None:
+            return True
+        update_status("Natural 256 model unavailable; checking the existing INSwapper fallback.", NAME)
 
     variants = ["inswapper_128.onnx", "inswapper_128_fp16.onnx"]
     if _HAS_TORCH_CUDA:
@@ -280,6 +285,8 @@ def pre_check() -> bool:
 
 
 def pre_start() -> bool:
+    if modules.globals.swapper_model == "hyperswap_256":
+        return get_face_swapper() is not None
     # Check for either model variant
     fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
     fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
@@ -300,6 +307,19 @@ def get_face_swapper() -> Any:
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
+            if modules.globals.swapper_model == "hyperswap_256":
+                from modules.model_downloader import ensure_model
+                from modules.processors.frame.natural_swapper import Natural256Swapper
+                from modules.processors.frame._onnx_enhancer import build_provider_config
+
+                path = ensure_model("hyperswap_1a_256.onnx")
+                if path is not None:
+                    try:
+                        FACE_SWAPPER = Natural256Swapper(path, build_provider_config())
+                        update_status("HyperSwap-256 loaded (native 256px).", NAME)
+                        return FACE_SWAPPER
+                    except Exception as error:
+                        update_status(f"Natural 256 load failed; retaining INSwapper fallback: {error}", NAME)
             # Prefer FP16 on GPUs with Tensor Cores (Turing+) — half the
             # memory bandwidth, faster inference.  Fall back to FP32 for
             # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
@@ -372,6 +392,18 @@ def get_face_swapper() -> Any:
     return FACE_SWAPPER
 
 
+def select_swapper_model(name: str) -> None:
+    """Switch model only while the camera is stopped, then reload on start."""
+    global FACE_SWAPPER
+    if name not in {"hyperswap_256", "inswapper_128"}:
+        raise ValueError(f"Unknown face model: {name}")
+    with THREAD_LOCK:
+        modules.globals.swapper_model = name
+        FACE_SWAPPER = None
+    from modules.processors.frame._onnx_enhancer import _LIVE_ENHANCER_CACHE
+    _LIVE_ENHANCER_CACHE.clear()
+
+
 _HAS_TORCH_CUDA = False
 try:
     import torch
@@ -397,8 +429,8 @@ def _get_soft_alpha(size: int) -> np.ndarray:
     per-frame gives a visually equivalent feather at O(crop_area) cost —
     the feather radius scales naturally with the affine transform.
     """
-    erosion = modules.globals.mask_erosion
-    blur = modules.globals.mask_blur
+    erosion = round(modules.globals.mask_erosion * size / 128.)
+    blur = modules.globals.mask_blur * size / 128.
     key = (size, erosion, blur)
     if _paste_cache['alpha_key'] != key:
         # Wide oval safety envelope. Dense frame-space landmarks still define
@@ -581,6 +613,9 @@ def _restore_camera_microtexture(
         0.0, 1.0,
     )[:, None]
     alpha *= ramp
+    from modules.processors.frame.face_detail import skin_microtexture_gate
+
+    alpha *= skin_microtexture_gate(camera_u8)
     restored = (
         generated_face.astype(np.float32)
         + detail * (amount * alpha[:, :, None])
@@ -1063,7 +1098,9 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         bgr_fake = _restore_camera_microtexture(
             bgr_fake,
             camera_face_crop,
-            float(getattr(modules.globals, "detail_strength", 0.58)) * 0.62,
+            min(float(getattr(modules.globals, "detail_strength", 0.58)) * 0.62, .18)
+            if getattr(face_swapper, "native_resolution", 128) >= 256
+            else float(getattr(modules.globals, "detail_strength", 0.58)) * 0.62,
         )
         _SWAP_STATE.model_delta = float(np.mean(
             cv2.absdiff(bgr_fake, camera_face_crop)

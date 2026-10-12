@@ -12,6 +12,7 @@ HF_REPO_ID = "hacksider/deep-live-cam"
 HF_RESOLVE_BASE = f"https://huggingface.co/{HF_REPO_ID}/resolve/main/"
 
 MODEL_SIZES: Dict[str, int] = {
+    "hyperswap_1a_256.onnx": 402742682,
     "inswapper_128.onnx": 554253681,
     "inswapper_128_fp16.onnx": 277680638,
     "gfpgan-1024.onnx": 365875079,
@@ -43,6 +44,8 @@ def _lock_for(key: str) -> threading.Lock:
 
 
 def resolve_url(name: str) -> str:
+    if name == "hyperswap_1a_256.onnx":
+        return "https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1a_256.onnx"
     return HF_RESOLVE_BASE + name.replace(os.sep, "/")
 
 

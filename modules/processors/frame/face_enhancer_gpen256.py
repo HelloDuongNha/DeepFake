@@ -93,7 +93,16 @@ def enhance_face(temp_frame: Frame, face: Face, live: bool = False) -> Frame:
         print(f"{NAME}: {e}")
         return temp_frame
     try:
-        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE, live=live)
+        from modules.processors.frame.face_swapper import FACE_SWAPPER, get_last_swap_status
+        native_swapped = (
+            getattr(FACE_SWAPPER, "native_resolution", 128) >= 256
+            and get_last_swap_status() == "applied"
+        )
+        strength = .40 if native_swapped else 1.
+        return enhance_face_onnx(
+            temp_frame, face, session, INPUT_SIZE, live=live,
+            restoration_strength=strength,
+        )
     except Exception as e:
         print(f"{NAME}: Error during face enhancement: {e}")
         return temp_frame

@@ -220,7 +220,17 @@ def get_source_face(frame: Frame) -> Any:
     """Extract identity and landmarks from the original source portrait."""
     if frame is None:
         return None
-    return get_one_face(frame)
+    face = get_one_face(frame)
+    kps = getattr(face, "kps", None)
+    if face is not None and kps is not None and np.asarray(kps).shape == (5, 2):
+        import cv2
+        from insightface.utils import face_align
+        affine = face_align.estimate_norm(np.asarray(face.kps, np.float32), 128) * 2.
+        face.skin_reference = cv2.warpAffine(
+            frame, affine, (256, 256), flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+    return face
 
 
 def get_many_faces(frame: Frame) -> Any:

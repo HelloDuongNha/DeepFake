@@ -358,6 +358,7 @@ def save_switch_states():
         "fp_ui": modules.globals.fp_ui,
         "show_fps": modules.globals.show_fps,
         "eye_detail": modules.globals.eye_detail,
+        "swapper_model": modules.globals.swapper_model,
         "preserve_inner_mouth": modules.globals.preserve_inner_mouth,
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
@@ -393,6 +394,11 @@ def load_switch_states():
         modules.globals.fp_ui = state.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = state.get("show_fps", False)
         modules.globals.eye_detail = state.get("eye_detail", modules.globals.eye_detail)
+        selected_model = os.environ.get(
+            "DLC_SWAP_MODEL", state.get("swapper_model", modules.globals.swapper_model)
+        )
+        if selected_model in {"hyperswap_256", "inswapper_128"}:
+            modules.globals.swapper_model = selected_model
         modules.globals.preserve_inner_mouth = state.get(
             "preserve_inner_mouth", modules.globals.preserve_inner_mouth
         )
@@ -668,8 +674,8 @@ class MainWindow(QMainWindow):
             "Flip the live camera horizontally so left and right follow your movement",
         )
         self.sw_eye_detail = make(
-            "eye_detail", "Eye detail (quality)",
-            "Optional second restorer for close frontal eyes; may change their look and lowers live FPS",
+            "eye_detail", "Eye detail",
+            "Gentle eye and eyebrow contrast using the current processed frame",
         )
         self.sw_inner_mouth = make(
             "preserve_inner_mouth", "Natural mouth",
@@ -707,6 +713,16 @@ class MainWindow(QMainWindow):
         self.cb_enhancer.currentTextChanged.connect(self._on_enhancer_change)
         self.cb_enhancer.setToolTip(_("Select a face enhancement model (None = no enhancement)"))
         grid.addWidget(self.cb_enhancer, enhancer_row, 1)
+
+        grid.addWidget(QLabel(_("Face model:")), enhancer_row + 1, 0)
+        self.cb_swapper = QComboBox()
+        self.cb_swapper.addItems(["Natural 256", "INSwapper 128"])
+        self.cb_swapper.setCurrentText(
+            "Natural 256" if modules.globals.swapper_model == "hyperswap_256" else "INSwapper 128"
+        )
+        self.cb_swapper.setToolTip(_("Choose the face model; stop Live before changing it"))
+        self.cb_swapper.currentTextChanged.connect(self._on_swapper_change)
+        grid.addWidget(self.cb_swapper, enhancer_row + 1, 1)
 
         return card
 
@@ -919,6 +935,19 @@ class MainWindow(QMainWindow):
         # Publish one selection, without transient all-off states between
         # toggles. The processing worker snapshots this at frame boundaries.
         modules.globals.fp_ui = states
+        save_switch_states()
+
+    def _on_swapper_change(self, choice: str) -> None:
+        if modules.globals.webcam_preview_running:
+            self.cb_swapper.blockSignals(True)
+            self.cb_swapper.setCurrentText(
+                "Natural 256" if modules.globals.swapper_model == "hyperswap_256" else "INSwapper 128"
+            )
+            self.cb_swapper.blockSignals(False)
+            update_status("Stop Live before changing the face model.")
+            return
+        from modules.processors.frame.face_swapper import select_swapper_model
+        select_swapper_model("hyperswap_256" if choice == "Natural 256" else "inswapper_128")
         save_switch_states()
 
     def _on_transparency_change(self, value: float) -> None:
@@ -1470,20 +1499,23 @@ class _ProcessingWorker(QThread):
                         if swap_status != last_swap_status:
                             print(f"[webcam] Swap state: {swap_status}", flush=True)
                             last_swap_status = swap_status
-                        if swapped_bboxes:
+                        if swapped_bboxes and chosen_enhancer is None:
                             temp_frame = fp.apply_post_processing(temp_frame, swapped_bboxes)
                     else:
                         temp_frame = fp.process_frame(source_image, temp_frame)
                 if (
-                    swap_applied and cached_target_face is not None
+                    swap_applied and not hold_last_safe
+                    and cached_target_face is not None
                     and not modules.globals.many_faces
                     and modules.globals.eye_detail
                     and chosen_enhancer is not None
                     and chosen_enhancer.NAME == "DLC.FACE-ENHANCER-GPEN256"
                 ):
-                    from modules.processors.frame.eye_detail import apply_eye_detail_live
-                    temp_frame = apply_eye_detail_live(
-                        cached_target_face, temp_frame, source_image
+                    # GPEN can smooth a sharpen pass applied before it. Apply
+                    # only the current eye/brow detail after all restorers.
+                    from modules.processors.frame.face_detail import enhance_eye_clarity
+                    temp_frame = enhance_eye_clarity(
+                        temp_frame, cached_target_face, modules.globals.sharpness
                     )
                 if (
                     swap_applied and cached_target_face is not None
@@ -1597,11 +1629,6 @@ class WebcamPreviewWindow(QWidget):
         self._capture_worker = None
         self._processing_worker = None
         self._timer = None
-
-        if (modules.globals.eye_detail
-                and modules.globals.fp_ui.get("face_enhancer_gpen256", False)):
-            from modules.processors.frame.eye_detail import warmup_live_eye_detail
-            warmup_live_eye_detail()
 
         self._cap = VideoCapturer(int(camera_index))
         if not self._cap.start(LIVE_CAPTURE_WIDTH, LIVE_CAPTURE_HEIGHT, LIVE_CAPTURE_FPS):

@@ -448,6 +448,7 @@ def enhance_face_onnx(
     session: onnxruntime.InferenceSession,
     input_size: int,
     live: bool = False,
+    restoration_strength: float = 1.0,
 ) -> np.ndarray:
     """Enhance a single face in the frame using an ONNX face restoration model."""
     if (
@@ -549,6 +550,8 @@ def enhance_face_onnx(
     detail_strength = _closeup_detail_strength(
         modules.globals.detail_strength, inv_M, live
     )
+    if restoration_strength < 1.0:
+        detail_strength = min(detail_strength, .25)
     enhanced = blend_high_frequency(face_crop, restored, detail_strength)
     enhanced = add_adaptive_film_grain(face_crop, enhanced, modules.globals.film_grain_strength)
     if not isinstance(enhanced, np.ndarray) or enhanced.size == 0:
@@ -576,6 +579,14 @@ def enhance_face_onnx(
         # the red-grey cast seen while looking down.
         enhanced = match_skin_tone_lab(
             enhanced, face_crop, mask, strength=0.42
+        )
+
+    restoration_strength = float(np.clip(restoration_strength, 0., 1.))
+    if restoration_strength < 1.0:
+        # A native 256px swap already carries useful features. Retain them
+        # instead of letting restoration replace the complete skin/eye image.
+        enhanced = cv2.addWeighted(
+            face_crop, 1. - restoration_strength, enhanced, restoration_strength, 0
         )
 
     # Warp and blend only the face ROI; full-frame float conversion is costly

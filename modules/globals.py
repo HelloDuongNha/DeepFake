@@ -88,6 +88,9 @@ camera_input_combobox: Any | None = None # Placeholder for UI element if needed
 webcam_preview_running: bool = False
 show_fps: bool = False
 eye_detail: bool = os.environ.get("DLC_EYE_DETAIL", "0") != "0"
+swapper_model: str = os.environ.get("DLC_SWAP_MODEL", "hyperswap_256")
+if swapper_model not in {"hyperswap_256", "inswapper_128"}:
+    swapper_model = "hyperswap_256"
 preserve_inner_mouth: bool = os.environ.get("DLC_PRESERVE_INNER_MOUTH", "1") != "0"
 
 # System Configuration
