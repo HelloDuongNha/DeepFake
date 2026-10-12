@@ -70,8 +70,8 @@ Set these environment variables before launch to tune the paste-back mask:
 | --- | --- | --- |
 | `DLC_MASK_BLUR` | `1.5` | Gaussian sigma in the aligned 128 px face crop; smaller means a narrower feather. Range: 0–16. |
 | `DLC_MASK_EROSION` | `4` | Pixels to erode the aligned mask; larger keeps the swapped area farther inside the face. Range: 0–16. |
-| `DLC_DETAIL_STRENGTH` | `0.35` | High-frequency camera texture mixed back after GPEN/GFPGAN. `0` disables it; `1` is strongest. |
-| `DLC_FILM_GRAIN` | `0.35` | Adaptive fine grain added after enhancement. It measures camera noise and uses a 2–4 level field; `0` disables it. |
+| `DLC_DETAIL_STRENGTH` | `0.50` | High-frequency camera texture mixed back after GPEN/GFPGAN. `0` disables it; `1` is strongest. `run_mac.sh` uses `0.68` for clearer pores and wrinkles. |
+| `DLC_FILM_GRAIN` | `0.20` | Adaptive fine grain added after enhancement. It measures camera noise and uses a subtle field; `0` disables it. |
 | `DLC_HAIRLINE_GUARD` | `0.16` | Forehead guard used by the legacy GFPGAN paste-back path; GPEN uses its complete aligned crop. |
 | `DLC_HAIR_PARSING` | `1` in `run_mac.sh` | Run the ONNX parser as a subtractive hair-only guard. Other labels cannot punch holes in the face. |
 | `DLC_HAIR_PARSER_MODEL` | `models/face_parsing_resnet18.onnx` | Override the parser model path. |

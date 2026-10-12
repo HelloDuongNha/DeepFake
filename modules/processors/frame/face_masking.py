@@ -141,34 +141,109 @@ def _track_face_region_translation(
         minDistance=5, mask=feature_mask, blockSize=5,
     )
     if features is None or len(features) < 4:
-        return False
-    tracked, status, _ = cv2.calcOpticalFlowPyrLK(
+        return _track_face_region_template(previous_gray, current_gray, face)
+    tracked, status, flow_error = cv2.calcOpticalFlowPyrLK(
         previous_gray, current_gray, features, None,
         winSize=(31, 31), maxLevel=3,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01),
     )
     if tracked is None or status is None:
-        return False
+        return _track_face_region_template(previous_gray, current_gray, face)
     valid = status.reshape(-1).astype(bool)
+    if flow_error is not None:
+        errors = np.asarray(flow_error, dtype=np.float32).reshape(-1)
+        if errors.size == valid.size:
+            # Occluding hands and newly exposed background can still return
+            # LK coordinates, but their patch reconstruction error is high.
+            # Exclude those points before estimating the face displacement.
+            valid &= np.isfinite(errors) & (errors <= 38.0)
     if np.count_nonzero(valid) < 4:
-        return False
+        return _track_face_region_template(previous_gray, current_gray, face)
     shifts = tracked[:, 0] - features[:, 0]
     median_shift = np.median(shifts[valid], axis=0)
     residual = np.linalg.norm(shifts - median_shift, axis=1)
     limit = max(2.0, 0.05 * max(x2 - x1, y2 - y1))
     inliers = valid & (residual <= limit)
     if np.count_nonzero(inliers) < 4:
-        return False
+        return _track_face_region_template(previous_gray, current_gray, face)
     displacement = np.median(shifts[inliers], axis=0).astype(np.float32)
     if np.linalg.norm(displacement) > 0.45 * max(x2 - x1, y2 - y1):
-        return False
+        return _track_face_region_template(previous_gray, current_gray, face)
+    _translate_face(face, displacement)
+    return is_plausible_face_geometry(face)
+
+
+def _translate_face(face: Face, displacement: np.ndarray) -> None:
+    """Move all cached face geometry by one image-space displacement."""
+    displacement = np.asarray(displacement, dtype=np.float32)
     face.kps = np.asarray(face.kps, dtype=np.float32) + displacement
-    face.bbox = bbox[:4] + np.tile(displacement, 2)
+    face.bbox = np.asarray(face.bbox, dtype=np.float32)[:4] + np.tile(
+        displacement, 2
+    )
     landmarks = getattr(face, "landmark_2d_106", None)
     if landmarks is not None:
         face.landmark_2d_106 = (
             np.asarray(landmarks, dtype=np.float32) + displacement
         )
+
+
+def _track_face_region_template(
+    previous_gray: np.ndarray,
+    current_gray: np.ndarray,
+    face: Face,
+) -> bool:
+    """Last-resort short-term tracking when profile landmarks disappear.
+
+    A tight central face patch is matched only inside a small search window.
+    This is deliberately translation-only: it bridges a few difficult yaw
+    frames without inventing new facial geometry or letting the mask drift.
+    """
+    bbox = getattr(face, "bbox", None)
+    if bbox is None:
+        return False
+    bbox = np.asarray(bbox, dtype=np.float32).reshape(-1)
+    if bbox.size < 4 or not np.all(np.isfinite(bbox[:4])):
+        return False
+    frame_h, frame_w = previous_gray.shape[:2]
+    width = float(bbox[2] - bbox[0])
+    height = float(bbox[3] - bbox[1])
+    if width < 18.0 or height < 18.0:
+        return False
+
+    # Exclude the hairline and jaw edge, whose appearance changes most during
+    # yaw. The remaining eyes/nose/upper-cheek texture is more stable.
+    tx1 = max(0, int(np.floor(bbox[0] + 0.14 * width)))
+    tx2 = min(frame_w, int(np.ceil(bbox[2] - 0.14 * width)))
+    ty1 = max(0, int(np.floor(bbox[1] + 0.18 * height)))
+    ty2 = min(frame_h, int(np.ceil(bbox[3] - 0.18 * height)))
+    if tx2 - tx1 < 12 or ty2 - ty1 < 12:
+        return False
+    template = previous_gray[ty1:ty2, tx1:tx2]
+    if float(np.std(template)) < 6.0:
+        return False
+
+    pad_x = max(8, int(round(width * 0.28)))
+    pad_y = max(8, int(round(height * 0.24)))
+    sx1 = max(0, tx1 - pad_x)
+    sy1 = max(0, ty1 - pad_y)
+    sx2 = min(frame_w, tx2 + pad_x)
+    sy2 = min(frame_h, ty2 + pad_y)
+    search = current_gray[sy1:sy2, sx1:sx2]
+    if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
+        return False
+    response = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, peak = cv2.minMaxLoc(response)
+    # A loose match can lock onto an occluding hand or background texture and
+    # keep stale face geometry alive. Require a clear correlation; the ROI
+    # detector remains the recovery path for larger pose changes.
+    if not np.isfinite(score) or score < 0.62:
+        return False
+    displacement = np.array(
+        [sx1 + peak[0] - tx1, sy1 + peak[1] - ty1], dtype=np.float32
+    )
+    if np.linalg.norm(displacement) > 0.40 * max(width, height):
+        return False
+    _translate_face(face, displacement)
     return is_plausible_face_geometry(face)
 
 
@@ -180,7 +255,7 @@ def track_face_landmarks(previous_gray: np.ndarray, current_gray: np.ndarray, fa
     if kps is None or np.asarray(kps).shape != (5, 2):
         return False
     previous = np.asarray(kps, dtype=np.float32).reshape(-1, 1, 2)
-    next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+    next_points, status, flow_error = cv2.calcOpticalFlowPyrLK(
         previous_gray, current_gray, previous, None,
         winSize=(35, 35), maxLevel=3,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01),
@@ -190,6 +265,10 @@ def track_face_landmarks(previous_gray: np.ndarray, current_gray: np.ndarray, fa
             previous_gray, current_gray, face
         )
     valid = status.reshape(-1).astype(bool)
+    if flow_error is not None:
+        errors = np.asarray(flow_error, dtype=np.float32).reshape(-1)
+        if errors.size == valid.size:
+            valid &= np.isfinite(errors) & (errors <= 32.0)
     if np.count_nonzero(valid) < 2 or not np.all(np.isfinite(next_points[valid])):
         return _track_face_region_translation(
             previous_gray, current_gray, face
@@ -898,6 +977,56 @@ def create_profile_nostril_restore_mask(
     ).astype(np.uint8)
 
 
+def create_squint_eye_restore_mask(face: Face, frame: Frame) -> np.ndarray:
+    """Return a stable partial camera-eye mask for strongly squinted eyes."""
+    if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+        return np.zeros((0, 0), dtype=np.uint8)
+    result = np.zeros(frame.shape[:2], dtype=np.uint8)
+    _, eyes = _feature_landmarks(face)
+    if not eyes or any(len(points) < 3 for points in eyes):
+        return result
+    openness_values = []
+    for points in eyes:
+        points = np.asarray(points, dtype=np.float32)
+        width = max(1.0, float(np.ptp(points[:, 0])))
+        openness_values.append(float(np.ptp(points[:, 1])) / width)
+    openness = float(np.mean(openness_values))
+    squint_amount = float(np.clip((0.23 - openness) / 0.12, 0.0, 1.0))
+    if squint_amount <= 0.0:
+        return result
+    bbox = getattr(face, "bbox", None)
+    kps = getattr(face, "kps", None)
+    if bbox is None or kps is None:
+        return result
+    bbox = np.asarray(bbox, dtype=np.float32).reshape(-1)
+    kps = np.asarray(kps, dtype=np.float32)
+    if (bbox.size < 4 or kps.shape != (5, 2)
+            or not np.all(np.isfinite(bbox[:4]))
+            or not np.all(np.isfinite(kps))):
+        return result
+    face_width = float(bbox[2] - bbox[0])
+    face_height = float(bbox[3] - bbox[1])
+    if face_width <= 8.0 or face_height <= 8.0:
+        return result
+    for eye in kps[:2]:
+        cv2.ellipse(
+            result,
+            tuple(np.rint(eye).astype(int)),
+            (
+                max(3, int(round(face_width * 0.115))),
+                max(2, int(round(face_height * 0.050))),
+            ),
+            0, 0, 360, 255, -1,
+        )
+    sigma = max(1.0, min(3.0, min(face_width, face_height) * 0.010))
+    result = cv2.GaussianBlur(result, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    # Retain up to 78% of the real eye expression. A small generated component
+    # remains so the transition stays consistent with the swapped identity.
+    return np.clip(
+        result.astype(np.float32) * (0.78 * squint_amount), 0, 255
+    ).astype(np.uint8)
+
+
 def create_profile_temple_exclusion_mask(
     face: Face, frame: Frame
 ) -> np.ndarray:
@@ -986,7 +1115,7 @@ def create_bbox_safety_mask(face: Face, frame: Frame) -> np.ndarray:
     axes = (
         # Keep both cheeks and temples farther inside the detector box so the
         # swap never reaches sideburns or hair beside the ear.
-        max(2, int(round(width * 0.39))),
+        max(2, int(round(width * 0.405))),
         max(2, int(round(height * 0.43))),
     )
     cv2.ellipse(result, center, axes, 0, 0, 360, 255, -1)
@@ -998,7 +1127,7 @@ def create_bbox_safety_mask(face: Face, frame: Frame) -> np.ndarray:
         result,
         (center[0], int(round(y1 + 0.30 * height))),
         (
-            max(2, int(round(width * 0.37))),
+            max(2, int(round(width * 0.385))),
             max(2, int(round(height * 0.18))),
         ),
         0, 0, 360, 255, -1,
@@ -1065,8 +1194,28 @@ def create_bbox_safety_mask(face: Face, frame: Frame) -> np.ndarray:
                 result[roi_y1:roi_y2, roi_x1:roi_x2] = np.clip(
                     roi.astype(np.float32) * keep, 0, 255
                 ).astype(np.uint8)
-    sigma = max(1.5, min(3.0, min(width, height) * 0.014))
-    result = cv2.GaussianBlur(result, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    # Rebuild alpha from signed edge distance. Only a narrow band around the
+    # outer contour is translucent; every pixel farther inside remains exactly
+    # 255, so feathering cannot soften pores, wrinkles, eyes, or the nose.
+    hard = (result >= 128).astype(np.uint8)
+    feather_width = max(5.0, min(9.0, min(width, height) * 0.045))
+    pad = int(np.ceil(feather_width)) + 2
+    roi_x1 = max(0, int(np.floor(x1)) - pad)
+    roi_x2 = min(result.shape[1], int(np.ceil(x2)) + pad + 1)
+    roi_y1 = max(0, int(np.floor(y1)) - pad)
+    roi_y2 = min(result.shape[0], int(np.ceil(y2)) + pad + 1)
+    roi_hard = hard[roi_y1:roi_y2, roi_x1:roi_x2]
+    inside = cv2.distanceTransform(roi_hard, cv2.DIST_L2, 3)
+    outside = cv2.distanceTransform(1 - roi_hard, cv2.DIST_L2, 3)
+    signed_distance = inside - outside
+    half_width = feather_width * 0.5
+    roi_alpha = np.clip(
+        (signed_distance + half_width) / feather_width, 0.0, 1.0
+    )
+    result.fill(0)
+    result[roi_y1:roi_y2, roi_x1:roi_x2] = np.rint(
+        roi_alpha * 255.0
+    ).astype(np.uint8)
     return result
 
 def _feature_landmarks(face: Face):
@@ -1214,6 +1363,16 @@ def aligned_feature_guard(face: Face, affine: np.ndarray, size: int) -> np.ndarr
         )[0]
         brow_centers = []
         for center in eye_centers:
+            # Always protect a stable ellipse around each eye. Dense eyelid
+            # landmarks collapse and reorder while squinting, which otherwise
+            # lets GPEN redraw different eye geometry on consecutive frames.
+            cv2.ellipse(
+                guard,
+                tuple(np.rint(center).astype(int)),
+                (max(3, int(size * 0.10)),
+                 max(2, int(size * 0.052))),
+                0, 0, 360, 255, -1,
+            )
             brow_center = (
                 int(round(center[0])), int(round(center[1] - size * 0.065))
             )
@@ -1243,7 +1402,7 @@ def aligned_feature_guard(face: Face, affine: np.ndarray, size: int) -> np.ndarr
                 tuple(np.rint(nose).astype(int)),
                 (max(3, int(size * 0.055)),
                  max(2, int(size * 0.045))),
-                0, 0, 360, 220, -1,
+                0, 0, 360, 255, -1,
             )
     else:
         brows = _eyebrow_landmarks(face)

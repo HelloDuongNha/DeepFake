@@ -370,6 +370,14 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertLessEqual(int(mask[95, 40]), 16)   # left ear edge
         self.assertLessEqual(int(mask[95, 140]), 16)  # right ear edge
         self.assertGreater(int(mask[98, 90]), 245)
+        # The expanded oval still excludes ears, but now crosses the boundary
+        # through several alpha levels instead of exposing a hard ring.
+        self.assertGreater(int(mask[98, 48]), 20)
+        self.assertLess(int(mask[98, 48]), 128)
+        self.assertGreater(int(mask[98, 50]), 128)
+        self.assertLess(int(mask[98, 50]), 230)
+        self.assertGreater(int(mask[98, 52]), int(mask[98, 50]))
+        self.assertTrue(np.all(mask[98, 60:121] == 255))
         # An ellipse cannot expose the four corners of an aligned crop box.
         self.assertEqual(int(mask[45, 50]), 0)
         self.assertEqual(int(mask[45, 130]), 0)
@@ -459,6 +467,62 @@ class RuntimeProfileTests(unittest.TestCase):
         # The visible/front side is byte-identical.
         np.testing.assert_array_equal(cleaned[:, :64], generated[:, :64])
 
+    def test_profile_nostril_blend_is_aligned_partial_and_translation_stable(self):
+        generated = np.full((128, 128, 3), 180, dtype=np.uint8)
+        camera = np.full_like(generated, 30)
+        kps = np.array([
+            [70., 40.], [90., 40.], [45., 62.],
+            [68., 92.], [88., 92.],
+        ], dtype=np.float32)
+        face = SimpleNamespace(kps=kps)
+        identity = np.array(
+            [[1., 0., 0.], [0., 1., 0.]], dtype=np.float32
+        )
+        blended = face_swapper._blend_aligned_profile_nostril(
+            generated, camera, face, identity
+        )
+        self.assertLess(int(np.min(blended[:, :, 0])), 120)
+        self.assertEqual(int(blended[10, 10, 0]), 180)
+
+        shifted_face = SimpleNamespace(kps=kps + [5., 3.])
+        compensate = np.array(
+            [[1., 0., -5.], [0., 1., -3.]], dtype=np.float32
+        )
+        shifted = face_swapper._blend_aligned_profile_nostril(
+            generated, camera, shifted_face, compensate
+        )
+        np.testing.assert_array_equal(blended, shifted)
+
+        frontal = SimpleNamespace(kps=kps.copy())
+        frontal.kps[2, 0] = 80.
+        unchanged = face_swapper._blend_aligned_profile_nostril(
+            generated, camera, frontal, identity
+        )
+        np.testing.assert_array_equal(unchanged, generated)
+
+    def test_profile_nostril_uses_full_resolution_camera_roi(self):
+        target = np.full((256, 256, 3), 30, dtype=np.uint8)
+        fake = np.full((128, 128, 3), 180, dtype=np.uint8)
+        affine = np.array(
+            [[0.5, 0., 0.], [0., 0.5, 0.]], dtype=np.float32
+        )
+        face = SimpleNamespace(
+            bbox=np.array([0., 0., 256., 256.], dtype=np.float32),
+            kps=np.array([
+                [140., 80.], [180., 80.], [90., 124.],
+                [136., 184.], [176., 184.],
+            ], dtype=np.float32),
+            landmark_2d_106=None,
+            landmark_2d_68=None,
+        )
+        result = face_swapper._fast_paste_back(
+            target, fake, fake, affine, target_face=face
+        )
+        # The aligned nostril center maps to roughly (96, 125). Camera detail
+        # is sampled after the 2x warp, while adjacent generated skin remains.
+        self.assertLess(int(result[125, 96, 0]), 120)
+        self.assertGreater(int(result[125, 125, 0]), 150)
+
     def test_profile_temple_exclusion_is_local_mirrored_and_yaw_only(self):
         frame = np.zeros((180, 180, 3), dtype=np.uint8)
         bbox = np.array([40., 30., 140., 155.], dtype=np.float32)
@@ -516,6 +580,32 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertLess(int(facing_left[92, 68]), 128)
         self.assertEqual(int(facing_left[96, 90]), 0)
         self.assertEqual(int(facing_right[96, 90]), 0)
+
+    def test_squint_restore_uses_stable_eye_centers_only_when_closed(self):
+        frame = np.zeros((180, 180, 3), dtype=np.uint8)
+        landmarks = np.zeros((106, 2), dtype=np.float32)
+        for indices, center_x in ((range(33, 43), 70.),
+                                  (range(87, 97), 110.)):
+            xs = np.linspace(center_x - 10, center_x + 10, len(indices))
+            landmarks[list(indices)] = np.column_stack((
+                xs, 75. + np.tile([-1., 1.], len(indices) // 2)
+            ))
+        face = SimpleNamespace(
+            bbox=np.array([40., 30., 140., 155.], dtype=np.float32),
+            kps=np.array([[70., 75.], [110., 75.], [90., 94.],
+                          [77., 118.], [103., 118.]], dtype=np.float32),
+            landmark_2d_106=landmarks,
+            landmark_2d_68=None,
+        )
+        squint = face_masking.create_squint_eye_restore_mask(face, frame)
+        self.assertGreater(int(squint[75, 70]), 190)
+        self.assertGreater(int(squint[75, 110]), 190)
+        self.assertEqual(int(squint[94, 90]), 0)
+
+        face.landmark_2d_106[33:43, 1] = np.linspace(69., 81., 10)
+        face.landmark_2d_106[87:97, 1] = np.linspace(69., 81., 10)
+        opened = face_masking.create_squint_eye_restore_mask(face, frame)
+        self.assertEqual(int(np.max(opened)), 0)
 
     def test_eyebrow_guard_does_not_protect_fake_temple_stroke(self):
         frame = np.zeros((180, 180, 3), dtype=np.uint8)
@@ -765,6 +855,30 @@ class RuntimeProfileTests(unittest.TestCase):
             self.assertTrue(face_masking.track_face_landmarks(gray, gray, face))
         np.testing.assert_allclose(face.kps, points + [6, -3])
 
+    def test_template_tracking_bridges_profile_landmark_loss(self):
+        rng = np.random.default_rng(7)
+        previous = np.zeros((140, 160), dtype=np.uint8)
+        texture = rng.integers(20, 235, size=(80, 70), dtype=np.uint8)
+        previous[30:110, 40:110] = texture
+        current = np.zeros_like(previous)
+        current[35:115, 47:117] = texture
+        points = np.array([[55, 55], [92, 55], [74, 72],
+                           [62, 91], [86, 91]], dtype=np.float32)
+        face = SimpleNamespace(
+            kps=points.copy(),
+            bbox=np.array([40, 30, 110, 110], dtype=np.float32),
+            landmark_2d_106=None,
+        )
+        with patch.object(face_masking.cv2, "calcOpticalFlowPyrLK",
+                          return_value=(None, None, None)), \
+             patch.object(face_masking.cv2, "goodFeaturesToTrack",
+                          return_value=None):
+            self.assertTrue(face_masking.track_face_landmarks(
+                previous, current, face
+            ))
+        np.testing.assert_allclose(face.kps, points + [7, 5], atol=1.0)
+        np.testing.assert_allclose(face.bbox, [47, 35, 117, 115], atol=1.0)
+
     def test_pose_affine_accepts_pitch_foreshortening_without_exploding(self):
         points = np.array([[30, 40], [70, 40], [50, 60],
                            [37, 80], [63, 80]], dtype=np.float32)
@@ -901,6 +1015,37 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(values[1], 100)
         self.assertEqual(values[0], values[2])
         self.assertNotEqual(values[0], values[1])
+
+    def test_live_gpen_waits_for_three_stable_frames_after_rejection(self):
+        class Session:
+            def get_inputs(self):
+                return [SimpleNamespace(name="input")]
+
+        session = Session()
+        identity = np.array(
+            [[1., 0., 0.], [0., 1., 0.]], dtype=np.float32
+        )
+        frame = np.full((256, 256, 3), 100, dtype=np.uint8)
+        enhancer._LIVE_ENHANCER_CACHE.pop(id(session), None)
+        with patch.object(settings, "detail_strength", 0.0), \
+             patch.object(settings, "film_grain_strength", 0.0), \
+             patch.object(settings, "color_match", False), \
+             patch.object(enhancer, "_get_face_affine",
+                          return_value=(identity, identity)), \
+             patch.object(enhancer, "parse_face_skin", return_value=None), \
+             patch.object(enhancer, "run_inference",
+                          return_value=np.zeros((1, 3, 256, 256),
+                                                dtype=np.float32)), \
+             patch.object(enhancer, "_restoration_is_plausible",
+                          side_effect=[False, True, True, True]):
+            values = [
+                int(enhancer.enhance_face_onnx(
+                    frame.copy(), object(), session, 256, live=True
+                )[128, 128, 0])
+                for _ in range(4)
+            ]
+        self.assertEqual(values[:3], [100, 100, 100])
+        self.assertNotEqual(values[3], 100)
 
     def test_live_restoration_rejects_white_side_hallucination(self):
         camera = np.full((128, 128, 3), 120, dtype=np.uint8)
@@ -1212,12 +1357,28 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(np.array_equal(result[:70], np.full_like(result[:70], 180)))
         self.assertLess(int(result[108, 70, 0]), 180)
 
-    def test_adaptive_film_grain_adds_subtle_texture(self):
+    def test_adaptive_film_grain_does_not_add_noise_to_clean_skin(self):
         camera = np.full((32, 32, 3), 120, dtype=np.uint8)
         restored = camera.copy()
         grain = enhancer.add_adaptive_film_grain(camera, restored, strength=0.5)
         self.assertEqual(grain.shape, restored.shape)
-        self.assertGreater(float(np.std(grain.astype(np.int16))), 0.1)
+        np.testing.assert_array_equal(grain, restored)
+
+    def test_detail_blend_rejects_sensor_noise_but_keeps_wrinkle(self):
+        rng = np.random.default_rng(18)
+        restored = np.full((64, 64, 3), 120, dtype=np.uint8)
+        camera = np.clip(
+            restored.astype(np.int16)
+            + rng.normal(0.0, 5.0, restored.shape).astype(np.int16),
+            0, 255,
+        ).astype(np.uint8)
+        camera[31:34, 12:52] = 165
+        blended = enhancer.blend_high_frequency(
+            camera, restored, strength=0.68
+        )
+        background_std = float(np.std(blended[4:24].astype(np.float32)))
+        self.assertLess(background_std, 2.5)
+        self.assertGreater(float(np.mean(blended[31:34, 18:46])), 126.0)
 
     def test_masked_lab_color_match_changes_only_face_roi(self):
         source = np.zeros((16, 16, 3), dtype=np.uint8)

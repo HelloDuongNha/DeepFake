@@ -18,6 +18,7 @@ from modules.platform_info import OPENVINO_PROVIDER_CONFIG
 from modules.processors.frame.face_masking import (
     match_skin_tone_lab, aligned_feature_guard,
     create_bbox_safety_mask, harmonize_mask_boundary,
+    create_squint_eye_restore_mask,
 )
 from modules.processors.frame.face_parser import parse_face_skin, skin_guard_for_crop
 
@@ -299,10 +300,23 @@ def blend_high_frequency(
             (restored_crop.shape[1], restored_crop.shape[0]),
             interpolation=cv2.INTER_LINEAR,
         )
-    camera = camera_crop.astype(np.float32)
+    # Remove single-pixel sensor/compression noise before extracting detail.
+    # Bilateral filtering keeps real edges such as pores, eyebrow hairs and
+    # wrinkles much better than blurring the final restored face.
+    camera_u8 = np.clip(camera_crop, 0, 255).astype(np.uint8)
+    camera = cv2.bilateralFilter(
+        camera_u8, d=5, sigmaColor=11.0, sigmaSpace=2.0
+    ).astype(np.float32)
     restored = restored_crop.astype(np.float32)
     low_frequency = cv2.GaussianBlur(camera, (0, 0), sigmaX=2.0, sigmaY=2.0)
     high_frequency = camera - low_frequency
+    # A small soft threshold removes residual codec shimmer while retaining
+    # stronger, structured skin detail. Unlike a final blur, this does not
+    # soften the eyes, nose or face boundary.
+    high_frequency = np.sign(high_frequency) * np.maximum(
+        np.abs(high_frequency) - 0.8, 0.0
+    )
+    high_frequency = np.clip(high_frequency, -24.0, 24.0)
     blended = np.clip(restored + high_frequency * strength, 0.0, 255.0)
     return blended.astype(np.uint8)
 
@@ -335,9 +349,10 @@ def add_adaptive_film_grain(
     median = float(np.median(residual))
     mad = float(np.median(np.abs(residual - median)))
     measured_std = 1.4826 * mad
-    # Typical webcam ISO grain is only a few 8-bit levels.  Keep a small floor
-    # so an unusually clean synthetic crop still receives natural microtexture.
-    noise_std = float(np.clip(measured_std, 2.0, 4.0)) * strength
+    # Do not manufacture grain when the camera crop is already clean. Remove
+    # the low-amplitude codec floor and copy only a small part of measured
+    # luminance grain so consecutive live frames do not visibly shimmer.
+    noise_std = float(np.clip(measured_std - 0.8, 0.0, 2.5)) * strength * 0.65
     if noise_std <= 0.0:
         return restored_crop
     noise = np.zeros(restored_crop.shape[:2], dtype=np.float32)
@@ -447,7 +462,11 @@ def enhance_face_onnx(
     # if a legacy environment still requests an interval > 1.
     interval = 1 if input_size == 256 else (modules.globals.enhancer_interval if live else 1)
     cache = _LIVE_ENHANCER_CACHE.setdefault(
-        id(session), {"count": 0, "enhanced": None, "reject_count": 0}
+        id(session), {
+            "count": 0, "enhanced": None, "reject_count": 0,
+            "suspended": False, "recovery_streak": 0,
+            "reject_log_count": 0,
+        }
     )
     if live:
         cache["count"] += 1
@@ -479,17 +498,37 @@ def enhance_face_onnx(
             face_crop, restored, cache.get("enhanced")
         ):
             cache["reject_count"] = int(cache.get("reject_count", 0)) + 1
+            cache["reject_log_count"] = int(
+                cache.get("reject_log_count", 0)
+            ) + 1
+            cache["suspended"] = True
+            cache["recovery_streak"] = 0
             # A source-image change can legitimately replace the aligned
             # identity. After three guarded frames, forget the old temporal
             # reference so the new stable identity can establish itself.
             if cache["reject_count"] >= 3:
                 cache["enhanced"] = None
                 cache["reject_count"] = 0
-            print("[GPEN] Rejected unstable restoration; keeping current swapped frame", flush=True)
+            # A difficult pose can reject many consecutive enhancer frames.
+            # Report the state without flooding the terminal every frame.
+            if cache["reject_log_count"] == 1 or cache["reject_log_count"] % 30 == 0:
+                print("[GPEN] Rejected unstable restoration; keeping current swapped frame", flush=True)
             return frame
         if live:
             cache["enhanced"] = restored
             cache["reject_count"] = 0
+            cache["reject_log_count"] = 0
+            if cache.get("suspended", False):
+                cache["recovery_streak"] = int(
+                    cache.get("recovery_streak", 0)
+                ) + 1
+                # Do not alternate between a sharp raw swap and one plausible
+                # restoration after a bad pitch/squint frame. Resume only
+                # after three consecutive plausible outputs.
+                if cache["recovery_streak"] < 3:
+                    return frame
+                cache["suspended"] = False
+                cache["recovery_streak"] = 0
     else:
         restored = cache["enhanced"]
 
@@ -578,6 +617,14 @@ def enhance_face_onnx(
         )
         if retained >= 0.35:
             warped_mask = candidate
+    squint_restore = create_squint_eye_restore_mask(face, frame)
+    if (squint_restore.shape == frame.shape[:2]
+            and np.any(squint_restore)):
+        warped_mask = cv2.multiply(
+            warped_mask,
+            255 - squint_restore[y1:y2, x1:x2],
+            scale=1.0 / 255.0,
+        )
     if warped_mask is None or warped_mask.size == 0 or not np.any(warped_mask):
         print("[GPEN] Warped alpha mask is empty; returning camera frame", flush=True)
         return frame

@@ -64,11 +64,11 @@ enhancer_interval: int = _env_int("DLC_ENHANCER_INTERVAL", 1, 1, 6)
 # avoiding visible camera noise.
 detail_strength: float = _env_float(
     "DLC_DETAIL_STRENGTH",
-    _env_float("DLC_ENHANCER_FIDELITY", 0.35, 0.0, 1.0),
+    _env_float("DLC_ENHANCER_FIDELITY", 0.50, 0.0, 1.0),
     0.0,
     1.0,
 )
-film_grain_strength: float = _env_float("DLC_FILM_GRAIN", 0.35, 0.0, 1.0)
+film_grain_strength: float = _env_float("DLC_FILM_GRAIN", 0.08, 0.0, 1.0)
 # Fraction of the aligned crop above the forehead that is kept out of the
 # generic paste-back mask.  The live detector normally exposes only five
 # landmarks, so this lightweight guard protects real hair without running a

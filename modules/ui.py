@@ -507,7 +507,7 @@ class MainWindow(QMainWindow):
         self._destroy_cb = destroy_cb
 
         self.setWindowTitle(
-            f"{modules.metadata.name} {modules.metadata.version} {modules.metadata.edition}"
+            f"{modules.metadata.name} {modules.metadata.version}"
         )
         self.setMinimumSize(ROOT_WIDTH, ROOT_HEIGHT)
         self.resize(ROOT_WIDTH, ROOT_HEIGHT)
@@ -1172,6 +1172,8 @@ class _ProcessingWorker(QThread):
         landmark_smoother = TemporalLandmarkSmoother()
         previous_gray = None
         tracking_lost = False
+        detector_miss_streak = 0
+        last_stable_output = None
 
         while not self._stop.is_set():
             try:
@@ -1200,6 +1202,7 @@ class _ProcessingWorker(QThread):
                 if not modules.globals.many_faces:
                     current_gray = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2GRAY)
                 fresh_detection = False
+                detector_ran = False
                 active_det_interval = det_interval
                 if cached_target_face is not None:
                     bbox = getattr(cached_target_face, "bbox", None)
@@ -1210,6 +1213,7 @@ class _ProcessingWorker(QThread):
                             # pixels, so refresh them from the detector every frame.
                             active_det_interval = 1
                 if det_count % active_det_interval == 0:
+                    detector_ran = True
                     if modules.globals.many_faces:
                         landmark_smoother.reset()
                         previous_gray = None
@@ -1220,6 +1224,17 @@ class _ProcessingWorker(QThread):
                         if (detected is not None
                                 and not is_plausible_face_geometry(detected)):
                             detected = None
+                        # Full-frame RetinaFace can miss a heavily yawed or
+                        # partly covered face even though it remains close to
+                        # the last tracked position. Retry on that enlarged
+                        # local crop before treating the face as absent.
+                        if detected is None and cached_target_face is not None:
+                            detected = detect_one_face_near(
+                                temp_frame, cached_target_face
+                            )
+                            if (detected is not None
+                                    and not is_plausible_face_geometry(detected)):
+                                detected = None
                         cached_many_faces = None
                         if detected is not None:
                             # The final cheek mask uses the stable 106-point
@@ -1242,7 +1257,10 @@ class _ProcessingWorker(QThread):
                                 detected, time.monotonic(), reference_face=reference_face
                             )
                             tracking_lost = False
+                            detector_miss_streak = 0
                             fresh_detection = True
+                        else:
+                            detector_miss_streak += 1
                         # On a temporary miss, keep the last face and let
                         # optical flow carry it. Never drop the swap merely
                         # because yaw, a yawn or distance hid landmarks for a
@@ -1258,11 +1276,15 @@ class _ProcessingWorker(QThread):
                         # Pitch or a fast turn can temporarily invalidate LK.
                         # Reacquire in this frame instead of displaying a stale
                         # transform or waiting for the next detector cadence.
-                        emergency_face = detect_one_face_fast(temp_frame)
-                        if emergency_face is None:
-                            emergency_face = detect_one_face_near(
-                                temp_frame, cached_target_face
-                            )
+                        # A crop around the tracked face makes a strong yaw
+                        # much larger for RetinaFace and preserves identity
+                        # continuity. Only repeat a full-frame pass when this
+                        # frame has not already had one.
+                        emergency_face = detect_one_face_near(
+                            temp_frame, cached_target_face
+                        )
+                        if emergency_face is None and not detector_ran:
+                            emergency_face = detect_one_face_fast(temp_frame)
                         if (emergency_face is not None
                                 and not is_plausible_face_geometry(emergency_face)):
                             emergency_face = None
@@ -1274,12 +1296,13 @@ class _ProcessingWorker(QThread):
                                 reference_face=None,
                             )
                             tracking_lost = False
+                            detector_miss_streak = 0
                 previous_gray = current_gray
 
                 cached_faces = None
                 if cached_many_faces:
                     cached_faces = cached_many_faces
-                elif cached_target_face is not None:
+                elif cached_target_face is not None and not tracking_lost:
                     cached_faces = [cached_target_face]
 
                 # Fast detection skips the 2d106 landmark model, but the mouth
@@ -1288,7 +1311,10 @@ class _ProcessingWorker(QThread):
                 if modules.globals.mouth_mask and cached_faces:
                     ensure_landmarks(temp_frame, cached_faces)
 
-                for fp in frame_processors:
+                hold_last_safe = tracking_lost and last_stable_output is not None
+                if hold_last_safe:
+                    temp_frame = last_stable_output.copy()
+                for fp in ([] if hold_last_safe else frame_processors):
                     if fp.NAME == "DLC.FACE-ENHANCER":
                         if modules.globals.fp_ui["face_enhancer"]:
                             temp_frame = fp.process_frame(
@@ -1341,6 +1367,13 @@ class _ProcessingWorker(QThread):
             temp_frame = _frame_or_camera_fallback(
                 temp_frame, frame, "processing pipeline"
             )
+
+            # Cache only frames produced from current, verified face geometry.
+            # This protects the preview from stale-mask distortion while the
+            # face is covered or outside the detector's valid pose range.
+            if (not modules.globals.map_faces and not tracking_lost
+                    and detector_miss_streak == 0):
+                last_stable_output = temp_frame.copy()
 
             current_time = time.time()
             frame_count += 1

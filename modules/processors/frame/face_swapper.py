@@ -25,6 +25,8 @@ from modules.processors.frame.face_masking import (
     match_skin_tone_lab,
     harmonize_mask_boundary,
     create_eyebrow_protection_mask,
+    create_squint_eye_restore_mask,
+    _yaw_rear_side,
 )
 from modules.processors.frame.face_parser import parse_face_skin, skin_guard_for_crop
 import os
@@ -540,9 +542,14 @@ def _restore_camera_microtexture(
     amount = float(np.clip(strength, 0.0, 0.45))
     if amount <= 0.0:
         return generated_face
-    camera = camera_face.astype(np.float32)
+    camera_u8 = np.clip(camera_face, 0, 255).astype(np.uint8)
+    camera = cv2.bilateralFilter(
+        camera_u8, d=5, sigmaColor=11.0, sigmaSpace=2.0
+    ).astype(np.float32)
     low = cv2.GaussianBlur(camera, (0, 0), sigmaX=1.6, sigmaY=1.6)
-    detail = np.clip(camera - low, -28.0, 28.0)
+    detail = camera - low
+    detail = np.sign(detail) * np.maximum(np.abs(detail) - 0.8, 0.0)
+    detail = np.clip(detail, -22.0, 22.0)
     height, width = generated_face.shape[:2]
     alpha = _get_soft_alpha(min(height, width)).astype(np.float32) / 255.0
     if alpha.shape != (height, width):
@@ -560,6 +567,78 @@ def _restore_camera_microtexture(
         + detail * (amount * alpha[:, :, None])
     )
     return np.clip(restored, 0, 255).astype(np.uint8)
+
+
+def _aligned_profile_nostril_mask(
+    face: Face,
+    affine: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Build a pose-locked nostril alpha mask in aligned-face coordinates."""
+    empty = np.zeros((max(0, height), max(0, width)), dtype=np.uint8)
+    if (height <= 0 or width <= 0 or affine is None
+            or np.asarray(affine).shape != (2, 3)):
+        return empty
+    _, yaw_amount = _yaw_rear_side(face)
+    if yaw_amount < 0.35:
+        return empty
+    kps = getattr(face, "kps", None)
+    if kps is None:
+        return empty
+    kps = np.asarray(kps, dtype=np.float32)
+    if kps.shape != (5, 2) or not np.all(np.isfinite(kps)):
+        return empty
+    aligned = cv2.transform(kps[None], np.asarray(affine, dtype=np.float32))[0]
+    nose = aligned[2]
+    eye_mid = np.mean(aligned[:2], axis=0)
+    toward_face = eye_mid - nose
+    length = float(np.linalg.norm(toward_face))
+    if length <= 1e-4:
+        return empty
+    toward_face /= length
+    size = float(min(height, width))
+    center = nose + toward_face * (size * 0.028)
+    center[1] += size * 0.018
+    angle = float(np.degrees(np.arctan2(toward_face[1], toward_face[0])))
+    hard = empty
+    cv2.ellipse(
+        hard,
+        tuple(np.rint(center).astype(int)),
+        (max(2, int(round(size * 0.050))),
+         max(2, int(round(size * 0.026)))),
+        angle, 0, 360, 255, -1,
+    )
+    sigma = max(0.8, min(2.0, size * 0.008))
+    soft = cv2.GaussianBlur(hard, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    pose_strength = float(np.clip((yaw_amount - 0.35) / 0.35, 0.0, 1.0))
+    return np.clip(
+        soft.astype(np.float32) * (0.68 * pose_strength), 0, 255
+    ).astype(np.uint8)
+
+
+def _blend_aligned_profile_nostril(
+    generated_face: np.ndarray,
+    camera_face: np.ndarray,
+    face: Face,
+    affine: np.ndarray,
+) -> np.ndarray:
+    """Compatibility helper for blending at an existing aligned resolution."""
+    if (generated_face is None or camera_face is None
+            or generated_face.size == 0 or camera_face.size == 0
+            or generated_face.shape != camera_face.shape):
+        return generated_face
+    height, width = generated_face.shape[:2]
+    mask = _aligned_profile_nostril_mask(
+        face, affine, height, width
+    ).astype(np.float32) / 255.0
+    if not np.any(mask):
+        return generated_face
+    return np.clip(
+        generated_face.astype(np.float32) * (1.0 - mask[:, :, None])
+        + camera_face.astype(np.float32) * mask[:, :, None],
+        0, 255,
+    ).astype(np.uint8)
 
 # CUDA graph swap session cache
 _cuda_graph_session = {
@@ -789,11 +868,45 @@ def _fast_paste_back(
         if retained >= 0.35:
             alpha_crop = candidate
 
+    if target_face is not None:
+        squint_restore = create_squint_eye_restore_mask(
+            target_face, target_img
+        )
+        if (squint_restore.shape == target_img.shape[:2]
+                and np.any(squint_restore)):
+            alpha_crop = cv2.multiply(
+                alpha_crop,
+                255 - squint_restore[y1p:y2p, x1p:x2p],
+                scale=1.0 / 255.0,
+            )
+
     if alpha_crop is None or alpha_crop.size == 0 or not np.any(alpha_crop):
         print("[face_swapper] Empty warped alpha mask; returning camera frame", flush=True)
         return target_img
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
+    if target_face is not None:
+        aligned_nostril = _aligned_profile_nostril_mask(
+            target_face, M, face_h, face_w
+        )
+        if np.any(aligned_nostril):
+            # Warp only the soft mask, then take nostril pixels directly from
+            # the full-resolution camera ROI. This avoids downsampling them to
+            # the 128px swap crop and removes the blur/stair-step artefact.
+            nostril_weight = cv2.warpAffine(
+                aligned_nostril,
+                IM_crop,
+                (crop_w, crop_h),
+                flags=cv2.INTER_LINEAR,
+                borderValue=0,
+            ).astype(np.float32) / 255.0
+            bgr_fake_crop = np.clip(
+                bgr_fake_crop.astype(np.float32)
+                * (1.0 - nostril_weight[:, :, None])
+                + target_crop.astype(np.float32)
+                * nostril_weight[:, :, None],
+                0, 255,
+            ).astype(np.uint8)
     eyebrow_guard = None
     if target_face is not None:
         full_guard = create_eyebrow_protection_mask(target_face, target_img)
