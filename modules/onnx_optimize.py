@@ -31,6 +31,7 @@ is paid only once per model.
 
 import os
 import platform
+import hashlib
 
 import numpy as np
 
@@ -55,7 +56,14 @@ def optimize_for_coreml(model_path: str, input_shape: tuple = None) -> str:
         return model_path
 
     base, ext = os.path.splitext(model_path)
-    optimized_path = f"{base}_coreml{ext}"
+    from modules.paths import CACHE_DIR, IS_PACKAGED
+    if IS_PACKAGED:
+        cache_dir = os.path.join(CACHE_DIR, "coreml")
+        os.makedirs(cache_dir, exist_ok=True)
+        key = hashlib.sha256(f"{os.path.abspath(model_path)}:{input_shape}".encode()).hexdigest()[:12]
+        optimized_path = os.path.join(cache_dir, f"{os.path.basename(base)}_{key}_coreml{ext}")
+    else:
+        optimized_path = f"{base}_coreml{ext}"
     if os.path.exists(optimized_path):
         if os.path.getmtime(optimized_path) >= os.path.getmtime(model_path):
             return optimized_path

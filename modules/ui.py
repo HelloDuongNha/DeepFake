@@ -100,8 +100,8 @@ PREVIEW_DEFAULT_HEIGHT = 360
 # Keep the original compact preview window. Capture resolution is configurable
 # independently through DLC_CAPTURE_WIDTH/HEIGHT, so resizing the window does
 # not force a full-screen-sized widget.
-LIVE_CAPTURE_WIDTH = int(os.environ.get("DLC_CAPTURE_WIDTH", "640"))
-LIVE_CAPTURE_HEIGHT = int(os.environ.get("DLC_CAPTURE_HEIGHT", "360"))
+LIVE_CAPTURE_WIDTH = int(os.environ.get("DLC_CAPTURE_WIDTH", "1920"))
+LIVE_CAPTURE_HEIGHT = int(os.environ.get("DLC_CAPTURE_HEIGHT", "1080"))
 LIVE_CAPTURE_FPS = int(os.environ.get("DLC_CAPTURE_FPS", "60"))
 
 POPUP_WIDTH = 750
@@ -280,6 +280,25 @@ def fit_image_to_size(image, width: int, height: int):
     return gpu_resize(image, dsize=new_size, interpolation=interpolation)
 
 
+def fill_image_to_size(image, width: int, height: int):
+    """Center-crop a BGR frame to fill the preview without stretching."""
+    if width <= 0 or height <= 0:
+        return image
+    source_height, source_width = image.shape[:2]
+    if source_width <= 0 or source_height <= 0:
+        return image
+    if source_width * height > source_height * width:
+        crop_width = max(1, round(source_height * width / height))
+        left = (source_width - crop_width) // 2
+        image = image[:, left:left + crop_width]
+    else:
+        crop_height = max(1, round(source_width * height / width))
+        top = (source_height - crop_height) // 2
+        image = image[top:top + crop_height, :]
+    interpolation = cv2.INTER_AREA if image.shape[1] > width else cv2.INTER_CUBIC
+    return gpu_resize(image, dsize=(width, height), interpolation=interpolation)
+
+
 def _bgr_to_qpixmap(bgr: np.ndarray) -> QPixmap:
     """Zero-copy BGR ndarray → QPixmap."""
     h, w = bgr.shape[:2]
@@ -338,12 +357,16 @@ def save_switch_states():
         "live_resizable": modules.globals.live_resizable,
         "fp_ui": modules.globals.fp_ui,
         "show_fps": modules.globals.show_fps,
+        "eye_detail": modules.globals.eye_detail,
+        "preserve_inner_mouth": modules.globals.preserve_inner_mouth,
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
     }
     try:
-        with open("switch_states.json", "w") as f:
+        from modules.paths import SETTINGS_PATH
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w") as f:
             json.dump(state, f)
     except OSError:
         pass
@@ -351,13 +374,17 @@ def save_switch_states():
 
 def load_switch_states():
     try:
-        with open("switch_states.json", "r") as f:
+        from modules.paths import SETTINGS_PATH
+        with open(SETTINGS_PATH, "r") as f:
             state = json.load(f)
         modules.globals.keep_fps = state.get("keep_fps", True)
         modules.globals.keep_audio = state.get("keep_audio", True)
         modules.globals.keep_frames = state.get("keep_frames", False)
         modules.globals.many_faces = state.get("many_faces", False)
-        modules.globals.map_faces = state.get("map_faces", False)
+        # The live UI uses one selected source face and one camera subject.
+        # A saved mapper setting sent it through a separate per-frame identity
+        # matching path, which could drop the mask during a smile.
+        modules.globals.map_faces = False
         modules.globals.poisson_blend = state.get("poisson_blend", False)
         modules.globals.color_correction = state.get("color_correction", False)
         modules.globals.nsfw_filter = state.get("nsfw_filter", False)
@@ -365,6 +392,10 @@ def load_switch_states():
         modules.globals.live_resizable = state.get("live_resizable", False)
         modules.globals.fp_ui = state.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = state.get("show_fps", False)
+        modules.globals.eye_detail = state.get("eye_detail", modules.globals.eye_detail)
+        modules.globals.preserve_inner_mouth = state.get(
+            "preserve_inner_mouth", modules.globals.preserve_inner_mouth
+        )
         # Mouth mask always starts disabled (slider at 0) on launch,
         # regardless of the persisted value — enable it explicitly each session.
         modules.globals.mouth_mask_size = 0.0
@@ -632,25 +663,36 @@ class MainWindow(QMainWindow):
                                  "Fix blue/green color cast from some webcams")
         self.sw_show_fps = make("show_fps", "Show FPS",
                                 "Display frames-per-second counter on the live preview")
-
-        # Map faces is special — closes mapper when toggled off.
-        self.sw_map_faces = _Switch(_("Map faces"), modules.globals.map_faces,
-                                    _("Manually assign which source face maps to which target face"))
-        self.sw_map_faces.toggled.connect(self._on_map_faces_toggled)
+        self.sw_live_mirror = make(
+            "live_mirror", "Mirror camera",
+            "Flip the live camera horizontally so left and right follow your movement",
+        )
+        self.sw_eye_detail = make(
+            "eye_detail", "Eye detail (quality)",
+            "Optional second restorer for close frontal eyes; may change their look and lowers live FPS",
+        )
+        self.sw_inner_mouth = make(
+            "preserve_inner_mouth", "Natural mouth",
+            "Keep real teeth and the inner mouth when opening wide; leave lips and surrounding skin swapped",
+        )
 
         # Layout: 2 columns of switches
         items = [
             self.sw_keep_fps, self.sw_keep_audio,
             self.sw_keep_frames, self.sw_many_faces,
-            self.sw_map_faces, self.sw_show_fps,
+            self.sw_show_fps,
             self.sw_poisson, self.sw_color_fix,
+            self.sw_live_mirror,
+            self.sw_eye_detail,
+            self.sw_inner_mouth,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)
 
         # Face enhancer dropdown
+        enhancer_row = (len(items) + 1) // 2
         enhancer_label = QLabel(_("Face Enhancer:"))
-        grid.addWidget(enhancer_label, len(items) // 2, 0)
+        grid.addWidget(enhancer_label, enhancer_row, 0)
 
         self.cb_enhancer = QComboBox()
         self.cb_enhancer.addItems(["None", "GFPGAN", "GPEN-512", "GPEN-256"])
@@ -664,7 +706,7 @@ class MainWindow(QMainWindow):
         self.cb_enhancer.setCurrentText(initial)
         self.cb_enhancer.currentTextChanged.connect(self._on_enhancer_change)
         self.cb_enhancer.setToolTip(_("Select a face enhancement model (None = no enhancement)"))
-        grid.addWidget(self.cb_enhancer, len(items) // 2, 1)
+        grid.addWidget(self.cb_enhancer, enhancer_row, 1)
 
         return card
 
@@ -693,7 +735,10 @@ class MainWindow(QMainWindow):
 
         # Sharpness
         grid.addWidget(QLabel(_("Sharpness")), 1, 0)
-        self.s_sharpness = slider(0.0, 5.0, 0.0, 10, self._on_sharpness_change)
+        self.s_sharpness = slider(
+            0.0, 5.0, modules.globals.sharpness, 100,
+            self._on_sharpness_change,
+        )
         self.s_sharpness.setToolTip(_("Sharpen the enhanced face output"))
         grid.addWidget(self.s_sharpness, 1, 1)
 
@@ -867,11 +912,13 @@ class MainWindow(QMainWindow):
             "GPEN-512": "face_enhancer_gpen512",
             "GPEN-256": "face_enhancer_gpen256",
         }
-        for key in ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"):
-            _update_tumbler(key, False)
         selected = key_map.get(choice)
-        if selected:
-            _update_tumbler(selected, True)
+        states = dict(modules.globals.fp_ui)
+        for key in ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"):
+            states[key] = key == selected
+        # Publish one selection, without transient all-off states between
+        # toggles. The processing worker snapshots this at frame boundaries.
+        modules.globals.fp_ui = states
         save_switch_states()
 
     def _on_transparency_change(self, value: float) -> None:
@@ -964,22 +1011,15 @@ class MainWindow(QMainWindow):
             f"name={self.cb_camera.currentText()!r}",
             flush=True,
         )
-        if _LIVE_MAPPER is not None and _LIVE_MAPPER.isVisible():
-            update_status("Source x Target Mapper is already open.")
-            _LIVE_MAPPER.raise_()
+        modules.globals.map_faces = False
+        if modules.globals.source_path is None:
+            update_status("Please select a source image first")
             return
-        if not modules.globals.map_faces:
-            if modules.globals.source_path is None:
-                update_status("Please select a source image first")
-                return
-            from modules.face_analyser import get_face_analyser
-            from modules.processors.frame.face_swapper import get_face_swapper
-            get_face_analyser()
-            get_face_swapper()
-            _open_webcam_preview(camera_index)
-        else:
-            modules.globals.source_target_map = []
-            _open_live_mapper_dialog(camera_index, modules.globals.source_target_map)
+        from modules.face_analyser import get_face_analyser
+        from modules.processors.frame.face_swapper import get_face_swapper
+        get_face_analyser()
+        get_face_swapper()
+        _open_webcam_preview(camera_index)
 
     def closeEvent(self, event):
         # Treat OS-level close as Destroy click
@@ -1063,6 +1103,18 @@ def _is_valid_camera_frame(frame) -> bool:
     )
 
 
+def face_swapper_metrics() -> tuple[str, str]:
+    from modules.processors.frame.face_swapper import (
+        get_last_swap_coverage, get_last_model_delta,
+    )
+    coverage = get_last_swap_coverage()
+    model_delta = get_last_model_delta()
+    return (
+        f"{coverage:.2f}" if coverage is not None else "n/a",
+        f"{model_delta:.2f}" if model_delta is not None else "n/a",
+    )
+
+
 def _frame_or_camera_fallback(candidate, camera_frame, stage: str):
     if _is_valid_camera_frame(candidate):
         return candidate
@@ -1086,6 +1138,7 @@ class _CaptureWorker(QThread):
 
     def run(self) -> None:
         consecutive_failures = 0
+        sent_initial_preview = False
         while not self._stop.is_set():
             ret, frame = self._cap.read()
             if not ret or not _is_valid_camera_frame(frame):
@@ -1103,7 +1156,12 @@ class _CaptureWorker(QThread):
                 self.msleep(20)
                 continue
             consecutive_failures = 0
-            self.rawFrame.emit(frame)
+            # The raw preview is needed only while the first processed frame
+            # loads. Queuing every full-resolution frame into Qt's UI thread
+            # wastes bandwidth and can delay processed preview updates.
+            if not sent_initial_preview:
+                self.rawFrame.emit(frame)
+                sent_initial_preview = True
             try:
                 self._queue.put_nowait(frame)
             except queue.Full:
@@ -1165,15 +1223,23 @@ class _ProcessingWorker(QThread):
         det_count = 0
         cached_target_face = None
         cached_many_faces = None
-        # Refresh dense geometry at about 25-30 Hz. The former ~12 Hz cadence
-        # left optical flow carrying fast head turns for too many frames and
-        # made a single bad track visibly stretch the mask.
-        det_interval = max(1, round(self._fps * 0.04))
+        # Detect on every frame that actually reaches the processing worker.
+        # The capture queue intentionally drops frames under load, so two
+        # processed frames are not guaranteed to be consecutive camera
+        # frames. Relying on optical flow across that gap made tracking fail
+        # after the capture resolution was raised to 720p.
+        det_interval = 1
         landmark_smoother = TemporalLandmarkSmoother()
         previous_gray = None
         tracking_lost = False
         detector_miss_streak = 0
         last_stable_output = None
+        last_tracking_status = None
+        last_swap_status = None
+        last_stage_report = 0.0
+        last_processor_sample = time.monotonic()
+        processed_since_sample = 0
+        measured_processing_fps = 0.0
 
         while not self._stop.is_set():
             try:
@@ -1181,6 +1247,10 @@ class _ProcessingWorker(QThread):
             except queue.Empty:
                 continue
 
+            frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+            enhancer_flags = dict(modules.globals.fp_ui)
+            swap_applied = False
+            swap_delta = None
             self._last_camera_frame = frame
             # Process a copy because face_swapper writes its paste-back in
             # place. Keep ``frame`` pristine for the raw-camera fallback and
@@ -1220,7 +1290,9 @@ class _ProcessingWorker(QThread):
                         cached_target_face = None
                         cached_many_faces = detect_many_faces_fast(temp_frame)
                     else:
-                        detected = detect_one_face_fast(temp_frame)
+                        detected = detect_one_face_fast(
+                            temp_frame, cached_target_face
+                        )
                         if (detected is not None
                                 and not is_plausible_face_geometry(detected)):
                             detected = None
@@ -1251,8 +1323,6 @@ class _ProcessingWorker(QThread):
                                 reference_face = None
                             else:
                                 reference_face = cached_target_face
-                            if reference_face is not None and previous_gray is not None:
-                                track_face_landmarks(previous_gray, current_gray, reference_face)
                             cached_target_face = landmark_smoother.update(
                                 detected, time.monotonic(), reference_face=reference_face
                             )
@@ -1305,28 +1375,57 @@ class _ProcessingWorker(QThread):
                 elif cached_target_face is not None and not tracking_lost:
                     cached_faces = [cached_target_face]
 
-                # Fast detection skips the 2d106 landmark model, but the mouth
-                # mask needs it. Attach landmarks on demand (computed once per
-                # detection cycle — the helper no-ops if already present).
-                if modules.globals.mouth_mask and cached_faces:
+                # Fast detection skips 2d106 landmarks. Both mouth features
+                # need them, so attach them only when either feature is active.
+                # The helper no-ops if the current detection already has them.
+                if (cached_faces and (
+                    modules.globals.mouth_mask
+                    or modules.globals.preserve_inner_mouth
+                )):
                     ensure_landmarks(temp_frame, cached_faces)
+
+                tracking_status = (
+                    "source_missing" if source_image is None else
+                    "tracking_lost" if tracking_lost else
+                    "no_face" if not cached_faces else "tracking"
+                )
+                if tracking_status != last_tracking_status:
+                    print(f"[webcam] Face state: {tracking_status}", flush=True)
+                    last_tracking_status = tracking_status
 
                 hold_last_safe = tracking_lost and last_stable_output is not None
                 if hold_last_safe:
                     temp_frame = last_stable_output.copy()
-                for fp in ([] if hold_last_safe else frame_processors):
+                # Swap must precede restoration, even after UI toggles change
+                # the shared processor list.
+                live_processors = sorted(
+                    frame_processors, key=lambda p: p.NAME != "DLC.FACE-SWAPPER"
+                )
+                active_enhancers = [
+                    p for p in live_processors
+                    if p.NAME.startswith("DLC.FACE-ENHANCER")
+                    and enhancer_flags.get(p.__name__.split(".")[-1], False)
+                ]
+                # A stale saved state may contain several enabled enhancers.
+                # The UI offers a single choice, so never chain restorers.
+                chosen_enhancer = active_enhancers[0] if active_enhancers else None
+                for fp in ([] if hold_last_safe else live_processors):
+                    if fp.NAME.startswith("DLC.FACE-ENHANCER") and fp is not chosen_enhancer:
+                        continue
+                    if fp.NAME.startswith("DLC.FACE-ENHANCER") and not swap_applied:
+                        continue
                     if fp.NAME == "DLC.FACE-ENHANCER":
-                        if modules.globals.fp_ui["face_enhancer"]:
+                        if enhancer_flags.get("face_enhancer", False):
                             temp_frame = fp.process_frame(
                                 None, temp_frame, detected_faces=cached_faces
                             )
                     elif fp.NAME == "DLC.FACE-ENHANCER-GPEN256":
-                        if modules.globals.fp_ui.get("face_enhancer_gpen256", False):
+                        if enhancer_flags.get("face_enhancer_gpen256", False):
                             temp_frame = fp.process_frame(
                                 None, temp_frame, detected_faces=cached_faces
                             )
                     elif fp.NAME == "DLC.FACE-ENHANCER-GPEN512":
-                        if modules.globals.fp_ui.get("face_enhancer_gpen512", False):
+                        if enhancer_flags.get("face_enhancer_gpen512", False):
                             temp_frame = fp.process_frame(
                                 None, temp_frame, detected_faces=cached_faces
                             )
@@ -1336,33 +1435,102 @@ class _ProcessingWorker(QThread):
                             result = temp_frame.copy()
                             for t_face in cached_many_faces:
                                 result = fp.swap_face(source_image, t_face, result)
-                                if hasattr(t_face, "bbox") and t_face.bbox is not None:
+                                applied = fp.get_last_swap_status() == "applied"
+                                swap_applied = swap_applied or applied
+                                if applied and hasattr(t_face, "bbox") and t_face.bbox is not None:
                                     swapped_bboxes.append(t_face.bbox.astype(int))
                             temp_frame = result
-                        elif cached_target_face is not None:
+                        elif cached_target_face is not None and not tracking_lost:
+                            diagnostic_due = time.monotonic() - last_stage_report >= 3.0
+                            if diagnostic_due:
+                                diagnostic_raw = temp_frame.copy()
                             temp_frame = fp.swap_face(
                                 source_image, cached_target_face, temp_frame
                             )
+                            swap_applied = fp.get_last_swap_status() == "applied"
+                            if diagnostic_due and swap_applied:
+                                box = np.rint(cached_target_face.bbox).astype(int)
+                                h, w = temp_frame.shape[:2]
+                                x1, y1 = max(0, box[0]), max(0, box[1])
+                                x2, y2 = min(w, box[2]), min(h, box[3])
+                                if x2 > x1 and y2 > y1:
+                                    diagnostic_roi = (slice(y1, y2), slice(x1, x2))
+                                    swap_delta = float(np.mean(cv2.absdiff(
+                                        temp_frame[diagnostic_roi],
+                                        diagnostic_raw[diagnostic_roi],
+                                    )))
                             if (
-                                hasattr(cached_target_face, "bbox")
+                                swap_applied and hasattr(cached_target_face, "bbox")
                                 and cached_target_face.bbox is not None
                             ):
                                 swapped_bboxes.append(cached_target_face.bbox.astype(int))
-                        temp_frame = fp.apply_post_processing(temp_frame, swapped_bboxes)
+                        swap_status = (
+                            fp.get_last_swap_status() if cached_faces else "no_target"
+                        )
+                        if swap_status != last_swap_status:
+                            print(f"[webcam] Swap state: {swap_status}", flush=True)
+                            last_swap_status = swap_status
+                        if swapped_bboxes:
+                            temp_frame = fp.apply_post_processing(temp_frame, swapped_bboxes)
                     else:
                         temp_frame = fp.process_frame(source_image, temp_frame)
+                if (
+                    swap_applied and cached_target_face is not None
+                    and not modules.globals.many_faces
+                    and modules.globals.eye_detail
+                    and chosen_enhancer is not None
+                    and chosen_enhancer.NAME == "DLC.FACE-ENHANCER-GPEN256"
+                ):
+                    from modules.processors.frame.eye_detail import apply_eye_detail_live
+                    temp_frame = apply_eye_detail_live(
+                        cached_target_face, temp_frame, source_image
+                    )
+                if (
+                    swap_applied and cached_target_face is not None
+                    and not modules.globals.many_faces
+                    and modules.globals.preserve_inner_mouth
+                    and not modules.globals.mouth_mask
+                ):
+                    from modules.processors.frame.face_masking import (
+                        preserve_open_mouth_interior,
+                    )
+                    camera_mouth_frame = (
+                        gpu_flip(frame, 1) if modules.globals.live_mirror else frame
+                    )
+                    temp_frame = preserve_open_mouth_interior(
+                        temp_frame, camera_mouth_frame, cached_target_face
+                    )
             else:
                 modules.globals.target_path = None
                 for fp in frame_processors:
                     if fp.NAME == "DLC.FACE-ENHANCER":
-                        if modules.globals.fp_ui["face_enhancer"]:
+                        if enhancer_flags.get("face_enhancer", False):
                             temp_frame = fp.process_frame_v2(temp_frame)
                     elif fp.NAME in ("DLC.FACE-ENHANCER-GPEN256", "DLC.FACE-ENHANCER-GPEN512"):
                         fp_key = fp.NAME.split(".")[-1].lower().replace("-", "_")
-                        if modules.globals.fp_ui.get(fp_key, False):
+                        if enhancer_flags.get(fp_key, False):
                             temp_frame = fp.process_frame_v2(temp_frame)
                     else:
                         temp_frame = fp.process_frame_v2(temp_frame)
+
+            if swap_delta is not None:
+                final_delta = float(np.mean(cv2.absdiff(
+                    temp_frame[diagnostic_roi], diagnostic_raw[diagnostic_roi]
+                )))
+                name = chosen_enhancer.NAME if chosen_enhancer else "None"
+                coverage, model_delta = face_swapper_metrics()
+                print(
+                    f"[webcam] Face pixels: swap_delta={swap_delta:.2f} "
+                    f"final_delta={final_delta:.2f} enhancer={name} "
+                    f"opacity={modules.globals.opacity:.2f} "
+                    f"mask_coverage={coverage} "
+                    f"processing_fps={measured_processing_fps:.1f} "
+                    f"model_delta={model_delta} "
+                    f"detector_misses={detector_miss_streak} "
+                    f"face_size={x2 - x1}x{y2 - y1}",
+                    flush=True,
+                )
+                last_stage_report = time.monotonic()
 
             temp_frame = _frame_or_camera_fallback(
                 temp_frame, frame, "processing pipeline"
@@ -1371,7 +1539,7 @@ class _ProcessingWorker(QThread):
             # Cache only frames produced from current, verified face geometry.
             # This protects the preview from stale-mask distortion while the
             # face is covered or outside the detector's valid pose range.
-            if (not modules.globals.map_faces and not tracking_lost
+            if (not modules.globals.map_faces and swap_applied and not tracking_lost
                     and detector_miss_streak == 0):
                 last_stable_output = temp_frame.copy()
 
@@ -1400,12 +1568,23 @@ class _ProcessingWorker(QThread):
                 except queue.Full:
                     pass
 
+            processed_since_sample += 1
+            sample_time = time.monotonic()
+            sample_duration = sample_time - last_processor_sample
+            if sample_duration >= 2.0:
+                measured_processing_fps = processed_since_sample / sample_duration
+                processed_since_sample = 0
+                last_processor_sample = sample_time
+
 
 class WebcamPreviewWindow(QWidget):
     def __init__(self, camera_index: int):
         super().__init__()
-        self.setWindowTitle("Live Preview")
-        self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
+        self.setWindowTitle("Live Preview • portrait 9:16")
+        screen = QApplication.primaryScreen()
+        available_height = screen.availableGeometry().height() if screen else 880
+        preview_height = min(960, max(480, available_height - 80))
+        self.resize(round(preview_height * 9 / 16), preview_height)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self._image_label = QLabel()
@@ -1418,6 +1597,11 @@ class WebcamPreviewWindow(QWidget):
         self._capture_worker = None
         self._processing_worker = None
         self._timer = None
+
+        if (modules.globals.eye_detail
+                and modules.globals.fp_ui.get("face_enhancer_gpen256", False)):
+            from modules.processors.frame.eye_detail import warmup_live_eye_detail
+            warmup_live_eye_detail()
 
         self._cap = VideoCapturer(int(camera_index))
         if not self._cap.start(LIVE_CAPTURE_WIDTH, LIVE_CAPTURE_HEIGHT, LIVE_CAPTURE_FPS):
@@ -1454,7 +1638,7 @@ class WebcamPreviewWindow(QWidget):
         """Display the camera before the first AI-processed frame is ready."""
         if self._has_processed_frame or not _is_valid_camera_frame(bgr_frame):
             return
-        fitted = fit_image_to_size(bgr_frame, self.width(), self.height())
+        fitted = fill_image_to_size(bgr_frame, self._image_label.width(), self._image_label.height())
         if _is_valid_camera_frame(fitted):
             self._image_label.setPixmap(_bgr_to_qpixmap(fitted))
 
@@ -1469,7 +1653,7 @@ class WebcamPreviewWindow(QWidget):
         if not _is_valid_camera_frame(bgr_frame):
             print("[webcam] Ignoring empty processed preview frame", flush=True)
             return
-        bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
+        bgr_frame = fill_image_to_size(bgr_frame, self._image_label.width(), self._image_label.height())
         if not _is_valid_camera_frame(bgr_frame):
             return
         self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
@@ -1486,9 +1670,14 @@ class WebcamPreviewWindow(QWidget):
             if worker is None:
                 continue
             try:
-                worker.wait(2000)
+                # A CoreML inference/model load can exceed two seconds.
+                # Dropping this window then destroys a live QThread and aborts
+                # the process; reopening can also race the shared model state.
+                worker.wait()
             except Exception:
                 pass
+        from modules.processors.frame.eye_detail import stop_live_eye_detail
+        stop_live_eye_detail()
         try:
             self._cap.release()
         except Exception:
@@ -1497,6 +1686,13 @@ class WebcamPreviewWindow(QWidget):
         if _WEBCAM_PREVIEW is self:
             _WEBCAM_PREVIEW = None
         event.accept()
+
+
+
+def shutdown_webcam() -> None:
+    """Join camera workers before the application releases Qt objects."""
+    if _WEBCAM_PREVIEW is not None:
+        _WEBCAM_PREVIEW.close()
 
 
 def _open_webcam_preview(camera_index: int) -> None:
@@ -1800,7 +1996,8 @@ def init(
         modules.globals.poisson_blend = False
 
     enhancer = os.environ.get(
-        "DLC_ENHANCER", "GPEN-256" if platform.system() == "Darwin" and platform.machine() == "arm64" else None
+        "DLC_ENHANCER",
+        "GPEN-256" if platform.system() == "Darwin" and platform.machine() == "arm64" else None,
     )
     if enhancer in {"None", "GFPGAN", "GPEN-512", "GPEN-256"}:
         _MAIN.cb_enhancer.setCurrentText(enhancer)

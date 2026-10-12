@@ -16,7 +16,7 @@ from modules.utilities import (
     is_video,
 )
 from modules.cluster_analysis import find_closest_centroid
-from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
+from modules.gpu_processing import gpu_gaussian_blur, gpu_add_weighted, gpu_resize
 from modules.platform_info import OPENVINO_PROVIDER_CONFIG
 from modules.processors.frame.face_masking import (
     create_bbox_safety_mask,
@@ -36,6 +36,26 @@ import time
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
+
+_SWAP_STATE = threading.local()
+
+
+def get_last_swap_status() -> str:
+    """Status of the current thread's latest swap, independent of detection."""
+    return getattr(_SWAP_STATE, "status", "not_run")
+
+
+def _set_swap_status(status: str) -> None:
+    _SWAP_STATE.status = status
+
+
+def get_last_swap_coverage() -> float | None:
+    return getattr(_SWAP_STATE, "coverage", None)
+
+
+def get_last_model_delta() -> float | None:
+    return getattr(_SWAP_STATE, "model_delta", None)
+
 
 # --- START: Added for Interpolation ---
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
@@ -229,10 +249,9 @@ FRAME_SKIP_COUNTER = 0
 ADAPTIVE_QUALITY = True
 # --- END: Mac M1-M5 Optimizations ---
 
-abs_dir = os.path.dirname(os.path.abspath(__file__))
-models_dir = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
-)
+from modules.paths import MODELS_DIR
+
+models_dir = MODELS_DIR
 
 def pre_check() -> bool:
     # Use models_dir instead of abs_dir to save to the correct location
@@ -548,7 +567,7 @@ def _restore_camera_microtexture(
     ).astype(np.float32)
     low = cv2.GaussianBlur(camera, (0, 0), sigmaX=1.6, sigmaY=1.6)
     detail = camera - low
-    detail = np.sign(detail) * np.maximum(np.abs(detail) - 0.8, 0.0)
+    detail = np.sign(detail) * np.maximum(np.abs(detail) - 1.5, 0.0)
     detail = np.clip(detail, -22.0, 22.0)
     height, width = generated_face.shape[:2]
     alpha = _get_soft_alpha(min(height, width)).astype(np.float32) / 255.0
@@ -772,6 +791,8 @@ def _fast_paste_back(
     ):
         print("[face_swapper] Invalid paste-back input; returning camera frame", flush=True)
         return target_img
+    _set_swap_status("paste_rejected")
+    _SWAP_STATE.coverage = None
     h, w = target_img.shape[:2]
     face_h, face_w = aimg.shape[:2]
     # inswapper's aligned-face space is square (128x128). _get_soft_alpha
@@ -802,6 +823,7 @@ def _fast_paste_back(
                     or quad_h < 0.50 * box_h or quad_h > 2.60 * box_h
                     or np.linalg.norm(quad_center - box_center)
                     > 0.70 * max(box_w, box_h)):
+                _set_swap_status("affine_bbox_mismatch")
                 return target_img
     x1 = int(np.floor(transformed[:, 0].min()))
     x2 = int(np.ceil(transformed[:, 0].max()))
@@ -852,6 +874,7 @@ def _fast_paste_back(
                 # The tracked face and affine no longer agree. Showing the
                 # camera for this frame is safer than ever exposing a square
                 # aligned crop; the UI detector immediately reacquires it.
+                _set_swap_status("mask_bbox_disjoint")
                 return target_img
             alpha_crop = candidate
 
@@ -885,6 +908,13 @@ def _fast_paste_back(
         return target_img
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
+    if target_face is not None and getattr(target_face, "bbox", None) is not None:
+        bbox = np.asarray(target_face.bbox, dtype=np.float32).reshape(-1)
+        if bbox.size >= 4 and np.all(np.isfinite(bbox[:4])):
+            area = max(1.0, float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])))
+            _SWAP_STATE.coverage = min(
+                1.0, float(np.count_nonzero(alpha_crop > 127)) / area
+            )
     if target_face is not None:
         aligned_nostril = _aligned_profile_nostril_mask(
             target_face, M, face_h, face_w
@@ -933,11 +963,14 @@ def _fast_paste_back(
         a_tgt = cv2.multiply(target_crop, inv_alpha, scale=1.0 / 255.0)
         target_img[y1p:y2p, x1p:x2p] = cv2.add(a_fake, a_tgt)
 
+    _set_swap_status("applied")
     return target_img
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """Optimized face swapping with better memory management and performance."""
+    _set_swap_status("invalid_frame")
+    _SWAP_STATE.model_delta = None
     if (
         not isinstance(temp_frame, np.ndarray)
         or temp_frame.size == 0
@@ -945,6 +978,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     ):
         print("[face_swapper] Empty input frame; skipping swap", flush=True)
         return temp_frame
+    _set_swap_status("model_unavailable")
     face_swapper = get_face_swapper()
     if face_swapper is None:
         update_status("Face swapper model not loaded or failed to load. Skipping swap.", NAME)
@@ -952,8 +986,10 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
     # Safety check for faces
     if source_face is None or target_face is None:
+        _set_swap_status("source_missing" if source_face is None else "target_missing")
         return temp_frame
     if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
+        _set_swap_status('source_embedding_missing')
         return temp_frame
 
     # _fast_paste_back writes in-place on the GPU path.  Only copy when
@@ -975,6 +1011,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
 
+    _set_swap_status("inference_failed")
     try:
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
@@ -1002,7 +1039,14 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
-        parsed_skin = parse_face_skin(temp_frame, target_face)
+        # The semantic hair guard only affects the rear temple at a turn.
+        # On a frontal face the landmark mask already stays clear of hair;
+        # running a 512px parser there costs a full extra model inference.
+        _, yaw_amount = _yaw_rear_side(target_face)
+        parsed_skin = (
+            parse_face_skin(temp_frame, target_face)
+            if yaw_amount >= 0.16 else None
+        )
 
         # Alpha blending does not receive Poisson's implicit colour solve.
         # Match the generated face to corresponding real cheek skin in aligned
@@ -1021,6 +1065,9 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
             camera_face_crop,
             float(getattr(modules.globals, "detail_strength", 0.58)) * 0.62,
         )
+        _SWAP_STATE.model_delta = float(np.mean(
+            cv2.absdiff(bgr_fake, camera_face_crop)
+        ))
 
         swapped_frame = _fast_paste_back(
             temp_frame, bgr_fake, _aimg_dummy, M, target_face=target_face,
@@ -1031,8 +1078,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
             return original_frame
 
     except Exception as e:
+        _set_swap_status("swap_exception")
         print(f"Error during face swap: {e}")
         return original_frame
+
+    if opacity == 0:
+        _set_swap_status("opacity_zero")
 
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
     # Now, work with the guaranteed uint8 'swapped_frame'
@@ -1113,6 +1164,59 @@ def get_faces_optimized(frame: Frame, use_cache: bool = True) -> Optional[List[F
 # --- END: Mac M1-M5 Optimized Face Detection ---
 
 # --- START: Helper function for interpolation and sharpening ---
+def _enhance_face_clarity(face_region: Frame, strength: float) -> Frame:
+    """Increase useful facial detail without inventing grain or edge halos.
+
+    Detail is measured from a bilateral-filtered guide instead of directly
+    from the camera pixels.  This keeps stable feature edges (eyes, nostrils,
+    lips and wrinkles), while sensor noise and compression blocks are not
+    amplified.  The clipped residual also prevents bright/dark ringing.
+    """
+    if strength <= 0.0 or face_region.size == 0:
+        return face_region
+
+    shortest = min(face_region.shape[:2])
+    # Small/distant faces need more edge contrast; close faces already carry
+    # enough pixels and receive a gentler pass to preserve natural skin.
+    distance_gain = float(np.clip(150.0 / max(shortest, 1), 0.85, 1.35))
+    effective_strength = min(float(strength) * distance_gain, 1.15)
+
+    guide = cv2.bilateralFilter(face_region, d=5, sigmaColor=9, sigmaSpace=2)
+    low_frequency = cv2.GaussianBlur(
+        guide, (0, 0), sigmaX=0.9, sigmaY=0.9,
+        borderType=cv2.BORDER_REFLECT101,
+    )
+    detail = guide.astype(np.float32) - low_frequency.astype(np.float32)
+    # Ignore tiny residuals that mostly represent sensor noise.  Keep the
+    # threshold soft so real low-contrast wrinkles are still retained.
+    magnitude = np.abs(detail)
+    detail = np.sign(detail) * np.maximum(magnitude - 1.5, 0.0)
+    detail = np.clip(detail, -16.0, 16.0)
+    # Retain strong edges from the camera while mildly damping low-contrast
+    # sensor shimmer on otherwise flat skin. This pass is already restricted
+    # to the inner face by _face_clarity_mask.
+    edge_confidence = np.clip(
+        (magnitude.max(axis=2, keepdims=True) - 2.0) / 5.0, 0.0, 1.0
+    )
+    base = face_region.astype(np.float32)
+    base -= (base - guide.astype(np.float32)) * (1.0 - edge_confidence) * 0.25
+    enhanced = base + detail * effective_strength
+    return np.clip(enhanced, 0, 255).astype(np.uint8)
+
+
+def _face_clarity_mask(height: int, width: int) -> np.ndarray:
+    """Return a soft inner-face mask that leaves hair and paste edges alone."""
+    mask = np.zeros((height, width), dtype=np.uint8)
+    center = (width // 2, int(round(height * 0.51)))
+    axes = (
+        max(1, int(round(width * 0.43))),
+        max(1, int(round(height * 0.45))),
+    )
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1, cv2.LINE_AA)
+    feather = max(1.2, min(height, width) * 0.035)
+    return cv2.GaussianBlur(mask, (0, 0), feather).astype(np.float32) / 255.0
+
+
 def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.ndarray]) -> Frame:
     """Applies sharpening and interpolation with Apple Silicon optimizations."""
     global PREVIOUS_FRAME_RESULT
@@ -1153,11 +1257,23 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
             if face_region.size == 0:
                 continue
 
-            # Apply sharpening (GPU-accelerated when CUDA OpenCV is available)
+            # Enhance only the inner face.  A rectangular sharpen pass also
+            # sharpens the mask boundary and nearby hair, producing the exact
+            # white/black rim and flicker this post-process is meant to avoid.
             try:
-                sigma = 2 if IS_APPLE_SILICON else 3
-                sharpened_region = gpu_sharpen(face_region, strength=sharpness_value, sigma=sigma)
-                processed_frame[y1:y2, x1:x2] = sharpened_region
+                sharpened_region = _enhance_face_clarity(
+                    face_region, strength=sharpness_value
+                )
+                alpha = _face_clarity_mask(
+                    face_region.shape[0], face_region.shape[1]
+                )[:, :, None]
+                blended = (
+                    face_region.astype(np.float32) * (1.0 - alpha)
+                    + sharpened_region.astype(np.float32) * alpha
+                )
+                processed_frame[y1:y2, x1:x2] = np.clip(
+                    blended, 0, 255
+                ).astype(np.uint8)
             except cv2.error:
                 pass
 

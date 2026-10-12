@@ -15,9 +15,46 @@ from pathlib import Path
 
 FACE_ANALYSER = None
 FACE_ANALYSER_LOCK = threading.Lock()
+FACE_DETECTION_LOCK = threading.Lock()
 
 DET_SIZE = (640, 640)
-DET_THRESHOLD = min(0.9, max(0.1, float(os.environ.get("DLC_DET_THRESHOLD", "0.40"))))
+DET_THRESHOLD = min(0.9, max(0.1, float(os.environ.get("DLC_DET_THRESHOLD", "0.35"))))
+RETRY_THRESHOLD = min(DET_THRESHOLD, 0.12)
+
+
+def _detect_with_threshold(det_model: Any, frame: Frame,
+                           threshold: float | None = None):
+    """Run a detection without leaking a temporary threshold to other threads."""
+    with FACE_DETECTION_LOCK:
+        had_threshold = hasattr(det_model, "det_thresh")
+        previous = getattr(det_model, "det_thresh", None)
+        try:
+            if threshold is not None:
+                det_model.det_thresh = threshold
+            return det_model.detect(frame, max_num=0, metric="default")
+        finally:
+            if had_threshold:
+                det_model.det_thresh = previous
+            elif threshold is not None:
+                del det_model.det_thresh
+
+
+def _low_confidence_candidates(det_model: Any, frame: Frame,
+                               minimum_side: float | None = None):
+    """Recover a large, well formed face after the normal detector misses."""
+    from insightface.app.common import Face
+    from modules.processors.frame.face_masking import is_plausible_face_geometry
+    bboxes, kpss = _detect_with_threshold(det_model, frame, RETRY_THRESHOLD)
+    if kpss is None or bboxes.shape[0] == 0:
+        return bboxes[:0], None
+    if minimum_side is None:
+        minimum_side = max(48.0, min(frame.shape[:2]) * 0.12)
+    selected = [i for i, box in enumerate(bboxes) if
+                min(box[2] - box[0], box[3] - box[1]) >= minimum_side
+                and is_plausible_face_geometry(Face(
+                    bbox=box[:4], kps=kpss[i], det_score=box[4]
+                ))]
+    return bboxes[selected], kpss[selected]
 
 
 def get_face_analyser() -> Any:
@@ -138,9 +175,13 @@ def _analyse_faces(frame: Frame) -> list:
     """
     fa = get_face_analyser()
 
-    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric="default")
+    bboxes, kpss = _detect_with_threshold(fa.det_model, frame)
     if bboxes.shape[0] == 0:
-        return []
+        if RETRY_THRESHOLD >= DET_THRESHOLD:
+            return []
+        bboxes, kpss = _low_confidence_candidates(fa.det_model, frame)
+        if bboxes.shape[0] == 0:
+            return []
 
     need_landmark = _needs_landmark()
     rec_model = fa.models.get("recognition")
@@ -192,7 +233,50 @@ def get_many_faces(frame: Frame) -> Any:
     except IndexError:
         return None
 
-def detect_one_face_fast(frame: Frame) -> Any:
+def _select_live_detection(bboxes, kpss, expected=None,
+                           reference_bbox=None, minimum_side=0.0):
+    """Choose the visible live face, preserving identity across frames."""
+    from insightface.app.common import Face
+    from modules.processors.frame.face_masking import is_plausible_face_geometry
+    if kpss is None:
+        return None
+    candidates = []
+    for i, box in enumerate(bboxes):
+        face = Face(bbox=box[:4].copy(), kps=kpss[i].copy(), det_score=box[4])
+        if not is_plausible_face_geometry(face):
+            continue
+        size = box[2:4] - box[:2]
+        if np.min(size) < minimum_side:
+            continue
+        if reference_bbox is not None:
+            prior = np.asarray(reference_bbox, dtype=np.float32)[:4]
+            prior_size = np.maximum(prior[2:4] - prior[:2], 1.0)
+            ratio = size / prior_size
+            # A 24-pixel false detection cannot replace a 500-pixel face.
+            # Real yaw and distance changes are still allowed generously.
+            if np.any(ratio < 0.28) or np.any(ratio > 3.5):
+                continue
+            prior_center = (prior[:2] + prior[2:4]) * 0.5
+            center = (box[:2] + box[2:4]) * 0.5
+            if np.linalg.norm(center - prior_center) > 1.5 * max(prior_size):
+                continue
+        candidates.append(i)
+    if not candidates:
+        return None
+    if expected is None:
+        # The largest plausible face is the webcam subject. Choosing the
+        # leftmost detection instead made a tiny background false positive
+        # steal the mask even while the subject sat still.
+        return max(candidates, key=lambda i: (
+            float(np.prod(bboxes[i, 2:4] - bboxes[i, :2])),
+            float(bboxes[i, 4]),
+        ))
+    return min(candidates, key=lambda i: float(np.linalg.norm(
+        (bboxes[i, :2] + bboxes[i, 2:4]) * 0.5 - expected
+    )))
+
+
+def detect_one_face_fast(frame: Frame, reference_face: Any = None) -> Any:
     """Detection-only — skips landmark and recognition models.
 
     Returns a Face with bbox, kps, det_score (enough for face swap).
@@ -200,10 +284,32 @@ def detect_one_face_fast(frame: Frame) -> Any:
     """
     from insightface.app.common import Face
     fa = get_face_analyser()
-    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
-    if bboxes.shape[0] == 0:
+    reference_score = getattr(reference_face, "det_score", 1.0)
+    threshold = (RETRY_THRESHOLD if reference_face is not None
+                 and reference_score is not None
+                 and float(reference_score) < DET_THRESHOLD else None)
+    bboxes, kpss = _detect_with_threshold(fa.det_model, frame, threshold)
+    reference_bbox = getattr(reference_face, "bbox", None)
+    expected = None
+    if reference_bbox is not None:
+        reference_bbox = np.asarray(reference_bbox, dtype=np.float32)[:4]
+        expected = (reference_bbox[:2] + reference_bbox[2:4]) * 0.5
+    minimum_side = max(24.0, min(frame.shape[:2]) * 0.03)
+    idx = _select_live_detection(
+        bboxes, kpss, expected, reference_bbox,
+        minimum_side=minimum_side,
+    )
+    if idx is None and threshold is None and RETRY_THRESHOLD < DET_THRESHOLD:
+        bboxes, kpss = _low_confidence_candidates(
+            fa.det_model, frame,
+            minimum_side=minimum_side if reference_bbox is not None else None,
+        )
+        idx = _select_live_detection(
+            bboxes, kpss, expected, reference_bbox,
+            minimum_side=minimum_side,
+        )
+    if idx is None:
         return None
-    idx = int(bboxes[:, 0].argmin())
     return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
 
 
@@ -235,15 +341,32 @@ def detect_one_face_near(frame: Frame, reference_face: Any) -> Any:
         return None
     crop = frame[top:bottom, left:right]
     fa = get_face_analyser()
-    bboxes, kpss = fa.det_model.detect(crop, max_num=0, metric="default")
-    if bboxes.shape[0] == 0:
-        return None
+    reference_score = getattr(reference_face, "det_score", 1.0)
+    threshold = (RETRY_THRESHOLD if reference_score is not None
+                 and float(reference_score) < DET_THRESHOLD else None)
+    bboxes, kpss = _detect_with_threshold(fa.det_model, crop, threshold)
     expected = np.array(
         [((x1 + x2) * 0.5) - left, ((y1 + y2) * 0.5) - top],
         dtype=np.float32,
     )
-    centers = (bboxes[:, :2] + bboxes[:, 2:4]) * 0.5
-    idx = int(np.argmin(np.linalg.norm(centers - expected, axis=1)))
+    local_reference_bbox = bbox[:4].copy()
+    local_reference_bbox[[0, 2]] -= left
+    local_reference_bbox[[1, 3]] -= top
+    idx = _select_live_detection(
+        bboxes, kpss, expected, local_reference_bbox,
+        minimum_side=max(24.0, min(frame.shape[:2]) * 0.03),
+    )
+    if idx is None and threshold is None and RETRY_THRESHOLD < DET_THRESHOLD:
+        bboxes, kpss = _low_confidence_candidates(
+            fa.det_model, crop,
+            minimum_side=max(24.0, min(frame.shape[:2]) * 0.03),
+        )
+        idx = _select_live_detection(
+            bboxes, kpss, expected, local_reference_bbox,
+            minimum_side=max(24.0, min(frame.shape[:2]) * 0.03),
+        )
+    if idx is None:
+        return None
     from insightface.app.common import Face
     recovered_bbox = bboxes[idx, :4].astype(np.float32).copy()
     recovered_bbox[[0, 2]] += left
@@ -262,7 +385,7 @@ def detect_many_faces_fast(frame: Frame) -> Any:
     """Detection-only multi-face — skips landmark and recognition."""
     from insightface.app.common import Face
     fa = get_face_analyser()
-    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    bboxes, kpss = _detect_with_threshold(fa.det_model, frame)
     if bboxes.shape[0] == 0:
         return None
     return [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
@@ -274,8 +397,8 @@ def ensure_landmarks(frame: Frame, faces: Any) -> None:
 
     The fast webcam path (detect_one_face_fast / detect_many_faces_fast)
     produces detection-only Face objects with no ``landmark_2d_106``.
-    Mouth masking needs those landmarks, so add them on demand only when
-    the feature is active — keeping the fast path fast otherwise.
+    Mouth masking and Natural mouth need those landmarks. Add them on demand
+    only while a mouth feature is active to keep the fast path fast otherwise.
     """
     if faces is None:
         return

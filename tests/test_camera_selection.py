@@ -79,6 +79,30 @@ class CameraSelectionTests(unittest.TestCase):
         self.assertFalse(_is_valid_camera_frame(np.empty((0, 0, 3), dtype=np.uint8)))
         self.assertIs(_frame_or_camera_fallback(None, raw, "test"), raw)
 
-
 if __name__ == "__main__":
     unittest.main()
+
+
+class CameraShutdownTests(unittest.TestCase):
+    def test_close_joins_workers_before_releasing_camera(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import modules.ui as ui
+        calls = []
+        class Worker:
+            def wait(self, *args):
+                calls.append(("wait", args))
+                return True
+        preview = SimpleNamespace(
+            _stop_event=SimpleNamespace(set=lambda: calls.append("stop")),
+            _timer=None,
+            _capture_worker=Worker(),
+            _processing_worker=Worker(),
+            _cap=SimpleNamespace(release=lambda: calls.append("release")),
+        )
+        event = Mock()
+        with patch.object(ui, "_WEBCAM_PREVIEW", preview):
+            ui.WebcamPreviewWindow.closeEvent(preview, event)
+            self.assertIsNone(ui._WEBCAM_PREVIEW)
+        self.assertEqual(calls, ["stop", ("wait", ()), ("wait", ()), "release"])
+        event.accept.assert_called_once()

@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import importlib
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType
 from typing import Any, List, Callable
@@ -14,6 +15,7 @@ import modules.globals
 from modules.face_analyser import get_one_face, get_source_face
 
 FRAME_PROCESSORS_MODULES: List[ModuleType] = []
+PROCESSORS_LOCK = threading.RLock()
 FRAME_PROCESSORS_INTERFACE = [
     'pre_check',
     'pre_start',
@@ -46,6 +48,11 @@ def load_frame_processor_module(frame_processor: str) -> Any:
 
 
 def get_frame_processors_modules(frame_processors: List[str]) -> List[ModuleType]:
+    with PROCESSORS_LOCK:
+        return list(_get_frame_processors_modules(frame_processors))
+
+
+def _get_frame_processors_modules(frame_processors: List[str]) -> List[ModuleType]:
     global FRAME_PROCESSORS_MODULES
 
     if not FRAME_PROCESSORS_MODULES:
@@ -56,6 +63,11 @@ def get_frame_processors_modules(frame_processors: List[str]) -> List[ModuleType
     return FRAME_PROCESSORS_MODULES
 
 def set_frame_processors_modules_from_ui(frame_processors: List[str]) -> None:
+    with PROCESSORS_LOCK:
+        _set_frame_processors_modules_from_ui(frame_processors)
+
+
+def _set_frame_processors_modules_from_ui(frame_processors: List[str]) -> None:
     global FRAME_PROCESSORS_MODULES
     current_processor_names = [proc.__name__.split('.')[-1] for proc in FRAME_PROCESSORS_MODULES]
 

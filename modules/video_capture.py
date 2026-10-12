@@ -150,6 +150,17 @@ class VideoCapturer:
                     self.cap = None
                     return False
 
+            # Some camera backends report the requested mode even when the
+            # delivered frames use another size. The frame shape is the mode
+            # the face detector and swapper will actually process.
+            self.actual_height, self.actual_width = self._prefetched_frame.shape[:2]
+
+            if self.actual_width != width or self.actual_height != height:
+                print(
+                    f"[VideoCapturer] Requested {width}x{height}@{fps}; "
+                    f"camera selected {self.actual_width}x{self.actual_height}",
+                    flush=True,
+                )
             print(f"[VideoCapturer] {self.actual_width}x{self.actual_height} "
                   f"@ {self.actual_fps:.1f}fps (reported={reported_fps:.0f})",
                   flush=True)

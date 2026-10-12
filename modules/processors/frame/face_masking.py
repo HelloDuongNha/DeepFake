@@ -384,6 +384,14 @@ class TemporalLandmarkSmoother:
             if (prior_bbox.shape != (4,)
                     or not np.all(np.isfinite(prior_bbox))):
                 prior_bbox = None
+        # A substantial distance change needs fresh geometry. Blending dense
+        # landmarks from the previous scale can misalign the swap and its guard.
+        anchor_bbox = prior_bbox if prior_bbox is not None else self._bbox
+        if raw_bbox is not None and anchor_bbox is not None:
+            old_size = np.maximum(anchor_bbox[2:] - anchor_bbox[:2], 1.0)
+            scale_ratio = (raw_bbox[2:] - raw_bbox[:2]) / old_size
+            if np.any(scale_ratio < 0.80) or np.any(scale_ratio > 1.25):
+                self.reset()
         first = self._kps is None
         previous_smoothed = None if first else self._kps.copy()
         geometry_transform = None
@@ -658,7 +666,15 @@ def harmonize_mask_boundary(
     if not np.any(interior):
         return source
     distance = cv2.distanceTransform(interior, cv2.DIST_L2, 3)
-    band_width = max(3.0, min(source.shape[:2]) * 0.04)
+    # The warped crop can be much wider than the visible face in profile.
+    # Bound correction by the mask's actual interior thickness: otherwise
+    # the nominal edge band reaches the centre of a small/narrow face.
+    interior_radius = float(distance.max())
+    band_width = min(
+        max(3.0, min(source.shape[:2]) * 0.04),
+        interior_radius * 0.40,
+    )
+    band_width = max(band_width, 1e-3)
     edge_weight = np.clip((band_width - distance) / band_width, 0.0, 1.0)
     # Do not alter pixels outside the mask. Ramp up through the translucent
     # fringe so an almost-zero alpha pixel cannot sample unrelated background.
@@ -668,8 +684,29 @@ def harmonize_mask_boundary(
     sigma = max(2.0, min(source.shape[:2]) / 48.0)
     source_f = source.astype(np.float32)
     target_f = target.astype(np.float32)
-    source_low = cv2.GaussianBlur(source_f, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    target_low = cv2.GaussianBlur(target_f, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    # Only the broad colour field needs blurring. Working on a smaller copy
+    # avoids two large Gaussian passes for a Full HD face while retaining
+    # native-resolution mask edges, eyebrow detail and texture below.
+    downscale = min(1.0, 384.0 / max(source.shape[:2]))
+    if downscale < 1.0:
+        small_size = (
+            max(1, round(source.shape[1] * downscale)),
+            max(1, round(source.shape[0] * downscale)),
+        )
+        source_small = cv2.resize(source_f, small_size, interpolation=cv2.INTER_AREA)
+        target_small = cv2.resize(target_f, small_size, interpolation=cv2.INTER_AREA)
+        small_sigma = max(0.8, sigma * downscale)
+        source_low = cv2.resize(
+            cv2.GaussianBlur(source_small, (0, 0), small_sigma),
+            (source.shape[1], source.shape[0]), interpolation=cv2.INTER_LINEAR,
+        )
+        target_low = cv2.resize(
+            cv2.GaussianBlur(target_small, (0, 0), small_sigma),
+            (target.shape[1], target.shape[0]), interpolation=cv2.INTER_LINEAR,
+        )
+    else:
+        source_low = cv2.GaussianBlur(source_f, (0, 0), sigma)
+        target_low = cv2.GaussianBlur(target_f, (0, 0), sigma)
     # Keep the conservative low-frequency correction used for normal lighting.
     # An unlimited correction made the whole edge follow bright highlights and
     # produced the uneven skin reported under direct sunlight.
@@ -685,7 +722,10 @@ def harmonize_mask_boundary(
     # Inspect a slightly deeper but capped band for narrow 2-4 px source-hair
     # curves. This wider reach only affects large per-pixel mismatches; normal
     # skin and texture still receive zero detail replacement.
-    detail_band = max(5.0, min(12.0, min(source.shape[:2]) * 0.065))
+    detail_band = max(1e-3, min(
+        max(5.0, min(12.0, min(source.shape[:2]) * 0.065)),
+        interior_radius * 0.60,
+    ))
     detail_edge = np.clip((detail_band - distance) / detail_band, 0.0, 1.0)
     detail_edge *= np.clip(alpha / 0.35, 0.0, 1.0)
     detail_weight = np.clip(detail_edge * 1.20, 0.0, 1.0) * mismatch_weight
@@ -1344,11 +1384,35 @@ def aligned_feature_guard(face: Face, affine: np.ndarray, size: int) -> np.ndarr
     """255 means preserve the pre-enhancer eye/mouth pixels at crop size."""
     mouth, eyes = _feature_landmarks(face)
     guard = np.zeros((size, size), dtype=np.uint8)
+    # At close range the swapper's 128 px eye region is visibly soft. Let
+    # GPEN contribute more only while the eyes are open and the pose is
+    # frontal. Squints and turned faces keep the original stable guard.
+    _, yaw_amount = _yaw_rear_side(face)
+    eye_open_ratio = min((
+        float(np.ptp(points[:, 1])) / max(1.0, float(np.ptp(points[:, 0])))
+        for points in (eyes or ())
+    ), default=0.0)
+    openness_weight = float(np.clip((eye_open_ratio - 0.18) / 0.07, 0.0, 1.0))
+    frontal_weight = float(np.clip((0.20 - yaw_amount) / 0.10, 0.0, 1.0))
+    bbox = getattr(face, "bbox", None)
+    if bbox is not None and np.asarray(bbox).shape == (4,):
+        face_width = float(np.asarray(bbox)[2] - np.asarray(bbox)[0])
+    else:
+        face_width = 0.0
+    close_weight = (
+        float(np.clip((face_width - 280.0) / 200.0, 0.0, 1.0))
+        if size <= 256 else 0.0
+    )
+    detail_weight = openness_weight * frontal_weight * close_weight
+    eye_guard_strength = int(round(255 - 65 * openness_weight * frontal_weight
+                                   - 130 * detail_weight))
+    eye_hull_strength = int(round(150 - 90 * detail_weight))
+    brow_guard_strength = int(round(180 - 120 * detail_weight))
     if eyes:
         for points in eyes:
             aligned = cv2.transform(points[None], affine)[0]
             hull = cv2.convexHull(np.rint(aligned).astype(np.int32))
-            cv2.fillConvexPoly(guard, hull, 150)
+            cv2.fillConvexPoly(guard, hull, eye_hull_strength)
     else:
         kps = getattr(face, "kps", None)
         if kps is not None and np.asarray(kps).shape == (5, 2):
@@ -1362,6 +1426,7 @@ def aligned_feature_guard(face: Face, affine: np.ndarray, size: int) -> np.ndarr
             np.asarray(kps[:2], dtype=np.float32)[None], affine
         )[0]
         brow_centers = []
+        brow_bridge = np.zeros_like(guard)
         for center in eye_centers:
             # Always protect a stable ellipse around each eye. Dense eyelid
             # landmarks collapse and reorder while squinting, which otherwise
@@ -1371,24 +1436,27 @@ def aligned_feature_guard(face: Face, affine: np.ndarray, size: int) -> np.ndarr
                 tuple(np.rint(center).astype(int)),
                 (max(3, int(size * 0.10)),
                  max(2, int(size * 0.052))),
-                0, 0, 360, 255, -1,
+                0, 0, 360, eye_guard_strength, -1,
             )
             brow_center = (
                 int(round(center[0])), int(round(center[1] - size * 0.065))
             )
             brow_centers.append(brow_center)
             cv2.ellipse(
-                guard,
+                brow_bridge,
                 brow_center,
                 (max(3, int(size * 0.14)), max(3, int(size * 0.105))),
-                0, 0, 360, 180, -1,
+                0, 0, 360, brow_guard_strength, -1,
             )
         # Join both stable brow guards. With yaw, the far eyebrow can otherwise
         # cross the narrow gap between two masks and appear split in half.
         cv2.line(
-            guard, brow_centers[0], brow_centers[1], 180,
+            brow_bridge, brow_centers[0], brow_centers[1], brow_guard_strength,
             max(3, int(size * 0.12)), lineType=cv2.LINE_AA,
         )
+        # The bridge joins the brows but must not overwrite the stronger eye
+        # protection when its thick antialiased stroke crosses an eyelid.
+        guard = np.maximum(guard, brow_bridge)
         # GPEN can turn a profile nostril shadow into a black triangular mark.
         # Preserve the stable face-swap nose at strong yaw instead of cutting a
         # moving camera patch into it, which produced a visible seam and jitter.
@@ -1425,6 +1493,73 @@ def _mask_blur(mask: np.ndarray) -> np.ndarray:
     if sigma <= 0:
         return mask
     return cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+
+def preserve_open_mouth_interior(
+    swapped_frame: Frame, camera_frame: Frame, face: Face
+) -> Frame:
+    """Keep current-frame teeth and oral cavity without revealing outer lips."""
+    if (not isinstance(swapped_frame, np.ndarray)
+            or not isinstance(camera_frame, np.ndarray)
+            or swapped_frame.shape != camera_frame.shape
+            or swapped_frame.ndim != 3 or swapped_frame.shape[2] != 3
+            or face is None):
+        return swapped_frame
+    points = getattr(face, "landmark_2d_106", None)
+    kps = getattr(face, "kps", None)
+    if points is None or kps is None:
+        return swapped_frame
+    points = np.asarray(points, dtype=np.float32)
+    kps = np.asarray(kps, dtype=np.float32)
+    if (points.shape != (106, 2) or kps.shape != (5, 2)
+            or not np.isfinite(points).all() or not np.isfinite(kps).all()):
+        return swapped_frame
+
+    mouth_width = float(np.linalg.norm(points[61] - points[52]))
+    if mouth_width < 40.0:
+        return swapped_frame
+    opening = float((points[60, 1] - points[62, 1]) / mouth_width)
+    opening_weight = float(np.clip((opening - 0.10) / 0.08, 0.0, 1.0))
+    eye_span = float(np.linalg.norm(kps[1] - kps[0]))
+    if eye_span < 15.0:
+        return swapped_frame
+    eye_mid_x = float((kps[0, 0] + kps[1, 0]) * 0.5)
+    yaw = abs(float((kps[2, 0] - eye_mid_x) / eye_span))
+    frontal_weight = float(np.clip((0.28 - yaw) / 0.10, 0.0, 1.0))
+    strength = opening_weight * frontal_weight
+    if strength <= 0.01:
+        return swapped_frame
+
+    # Trace only the inner lip; outer lips, cheeks, and skin stay swapped.
+    order = [52, 65, 66, 62, 70, 69, 61, 58, 57, 60, 54, 55]
+    polygon = np.rint(points[order]).astype(np.int32)
+    frame_h, frame_w = swapped_frame.shape[:2]
+    sigma = max(1.0, mouth_width * 0.008)
+    radius = max(1, min(4, round(max(0.0, points[60, 1] - points[62, 1]) * 0.055)))
+    margin = int(np.ceil(3.0 * sigma + radius + 2))
+    x1 = max(0, int(polygon[:, 0].min()) - margin)
+    y1 = max(0, int(polygon[:, 1].min()) - margin)
+    x2 = min(frame_w, int(polygon[:, 0].max()) + margin + 1)
+    y2 = min(frame_h, int(polygon[:, 1].max()) + margin + 1)
+    if x2 <= x1 or y2 <= y1:
+        return swapped_frame
+    mask = np.zeros((y2 - y1, x2 - x1), np.uint8)
+    cv2.fillPoly(mask, [polygon - np.array([x1, y1])], 255)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+    )
+    mask = cv2.erode(mask, kernel)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigma)
+    if not np.any(mask):
+        return swapped_frame
+    alpha = mask.astype(np.float32)[:, :, None] * (strength / 255.0)
+    swapped_roi = swapped_frame[y1:y2, x1:x2]
+    camera_roi = camera_frame[y1:y2, x1:x2]
+    swapped_roi[:] = np.clip(
+        swapped_roi.astype(np.float32) * (1.0 - alpha)
+        + camera_roi.astype(np.float32) * alpha, 0, 255
+    ).astype(np.uint8)
+    return swapped_frame
 
 
 def create_lower_mouth_mask(

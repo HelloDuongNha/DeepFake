@@ -1,6 +1,4 @@
 import os
-import platform
-import ssl
 import threading
 import urllib.error
 import urllib.request
@@ -33,8 +31,7 @@ CHUNK_SIZE = 1024 * 256
 
 
 def _ssl_context():
-    if platform.system().lower() == "darwin":
-        return ssl._create_unverified_context()
+    # Use the system trust store on every platform, including macOS.
     return None
 
 
@@ -61,7 +58,11 @@ def expected_size(name: str) -> Optional[int]:
 
 def is_present(name: str, dest_dir: Optional[str] = None) -> bool:
     path = local_path(name, dest_dir)
-    return os.path.isfile(path) and os.path.getsize(path) > 0
+    if not os.path.isfile(path):
+        return False
+    expected = expected_size(name)
+    size = os.path.getsize(path)
+    return size == expected if expected else size > 0
 
 
 def _download(name: str, url: str, target: str, size: Optional[int]) -> bool:
@@ -160,7 +161,11 @@ def ensure_any(names: List[str]) -> Optional[str]:
 
 
 def ensure_insightface_pack(name: str = "buffalo_l") -> bool:
-    members = [n for n in MODEL_SIZES if n.startswith(f"{name}/")]
+    # FaceAnalysis is created with detection, recognition and 2-D landmarks.
+    # The 3-D landmark and age/gender models are unused and need not be shipped.
+    required = {"det_10g.onnx", "w600k_r50.onnx", "2d106det.onnx"}
+    members = [n for n in MODEL_SIZES if n.startswith(f"{name}/")
+               and os.path.basename(n) in required]
     if not members:
         return False
 

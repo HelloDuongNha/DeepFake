@@ -25,10 +25,9 @@ THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-ENHANCER"
 MODEL_FILE = "gfpgan-1024.onnx"
 
-abs_dir = os.path.dirname(os.path.abspath(__file__))
-models_dir = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
-)
+from modules.paths import MODELS_DIR
+
+models_dir = MODELS_DIR
 
 # Standard FFHQ 5-point face template for 512x512 resolution
 # Points: left_eye, right_eye, nose, left_mouth, right_mouth
@@ -312,7 +311,8 @@ _enh_live_cache: dict = {
 }
 
 
-def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
+def enhance_face(temp_frame: Frame, detected_faces=None,
+                 use_temporal_cache: bool = True) -> Frame:
     """Enhances all faces in a frame using the GFPGAN ONNX model.
 
     Args:
@@ -344,7 +344,7 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
     # so reusing it in many_faces mode would paste the same face onto every
     # detected target.
     many_faces_mode = getattr(modules.globals, "many_faces", False)
-    use_cache = detected_faces is not None and not many_faces_mode
+    use_cache = detected_faces is not None and not many_faces_mode and use_temporal_cache
     if use_cache:
         _enh_live_cache['frame_count'] += 1
         interval = modules.globals.enhancer_interval

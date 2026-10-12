@@ -68,7 +68,7 @@ detail_strength: float = _env_float(
     0.0,
     1.0,
 )
-film_grain_strength: float = _env_float("DLC_FILM_GRAIN", 0.08, 0.0, 1.0)
+film_grain_strength: float = _env_float("DLC_FILM_GRAIN", 0.0, 0.0, 1.0)
 # Fraction of the aligned crop above the forehead that is kept out of the
 # generic paste-back mask.  The live detector normally exposes only five
 # landmarks, so this lightweight guard protects real hair without running a
@@ -87,6 +87,8 @@ live_resizable: bool = True
 camera_input_combobox: Any | None = None # Placeholder for UI element if needed
 webcam_preview_running: bool = False
 show_fps: bool = False
+eye_detail: bool = os.environ.get("DLC_EYE_DETAIL", "0") != "0"
+preserve_inner_mouth: bool = os.environ.get("DLC_PRESERVE_INNER_MOUTH", "1") != "0"
 
 # System Configuration
 max_memory: int | None = None        # Memory limit in GB? (Needs clarification)
@@ -101,7 +103,10 @@ fp_ui: Dict[str, bool] = {"face_enhancer": False, "face_enhancer_gpen256": False
 # Face Swapper Specific Options
 face_swapper_enabled: bool = True # General toggle for the swapper processor
 opacity: float = 1.0              # Blend factor for the swapped face (0.0-1.0)
-sharpness: float = 0.0            # Sharpness enhancement for swapped face (0.0-1.0+)
+# Detail enhancement is deliberately modest: it is applied through a soft
+# face-shaped mask and uses a denoised guide, so it improves feature edges
+# without sharpening the paste boundary or turning sensor noise into grain.
+sharpness: float = _env_float("DLC_SHARPNESS", 0.65, 0.0, 2.0)
 
 # Mouth Mask Options
 mouth_mask: bool = False           # Enable mouth area masking/pasting
@@ -112,7 +117,7 @@ mask_size: float = 1.0             # Expansion factor for upper lip mask (relati
 mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to chin)
 
 # --- START: Added for Frame Interpolation ---
-enable_interpolation: bool = True # Toggle temporal smoothing
+enable_interpolation: bool = False # Avoid motion ghosts; clarity pass is per-frame.
 interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Lower=smoother.
 # --- END: Added for Frame Interpolation ---
 

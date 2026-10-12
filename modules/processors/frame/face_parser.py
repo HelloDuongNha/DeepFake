@@ -15,8 +15,9 @@ import numpy as np
 import modules.globals
 
 _MODEL_NAME = "face_parsing_resnet18.onnx"
-_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))))), "models", _MODEL_NAME)
+from modules.paths import MODELS_DIR
+
+_MODEL_PATH = os.path.join(MODELS_DIR, _MODEL_NAME)
 _SESSION = None
 _SESSION_PATH = None
 _LOCK = threading.Lock()

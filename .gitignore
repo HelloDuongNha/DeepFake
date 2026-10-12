@@ -45,3 +45,8 @@ install.bat
 /.claude
 *.bat
 !run_windows.bat
+/build/
+/dist/
+/.build-venv/
+/packaging/*.iconset/
+/packaging/DeepLiveCam.png

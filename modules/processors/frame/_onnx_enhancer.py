@@ -15,6 +15,7 @@ import onnxruntime
 
 import modules.globals
 from modules.platform_info import OPENVINO_PROVIDER_CONFIG
+from modules.paths import CACHE_DIR
 from modules.processors.frame.face_masking import (
     match_skin_tone_lab, aligned_feature_guard,
     create_bbox_safety_mask, harmonize_mask_boundary,
@@ -31,8 +32,7 @@ _MASK_CACHE: dict[tuple, np.ndarray] = {}
 
 
 def tensorrt_provider_config():
-    cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))))), ".cache", "tensorrt")
+    cache_dir = os.path.join(CACHE_DIR, "tensorrt")
     os.makedirs(cache_dir, exist_ok=True)
     return ("TensorrtExecutionProvider", {
         "trt_engine_cache_enable": True,
@@ -182,18 +182,24 @@ def postprocess_face(output: np.ndarray) -> np.ndarray:
     return img
 
 
-def _restoration_is_plausible(
+def _restoration_is_plausible(camera_crop, restored_crop, previous_restored=None):
+    return _restoration_rejection_reason(
+        camera_crop, restored_crop, previous_restored
+    ) is None
+
+
+def _restoration_rejection_reason(
     camera_crop: np.ndarray,
     restored_crop: np.ndarray,
     previous_restored: np.ndarray | None = None,
-) -> bool:
+) -> str | None:
     """Reject a live restoration that hallucinates, smears, or clips side hair."""
     if (not isinstance(camera_crop, np.ndarray)
             or not isinstance(restored_crop, np.ndarray)
             or camera_crop.size == 0 or restored_crop.size == 0
             or camera_crop.shape != restored_crop.shape
             or camera_crop.ndim != 3 or restored_crop.ndim != 3):
-        return False
+        return "invalid_crop"
     camera_gray = cv2.cvtColor(camera_crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
     restored_gray = cv2.cvtColor(restored_crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
     height, width = camera_gray.shape
@@ -205,7 +211,7 @@ def _restoration_is_plausible(
         <= 1.0
     )
     if int(np.count_nonzero(face_region)) < 64:
-        return False
+        return "empty_face_region"
 
     # White or black side patches are a characteristic failed GPEN frame.
     side_region = face_region & (ny >= 0.12) & (ny <= 0.82) & (
@@ -216,7 +222,7 @@ def _restoration_is_plausible(
     new_black = side_region & (restored_gray <= 9.0) & (camera_gray >= 40.0)
     if ((np.count_nonzero(new_white) + np.count_nonzero(new_black))
             / side_count > 0.025):
-        return False
+        return "side_artifact"
 
     # Restoration may soften sensor noise, but it must not collapse all real
     # facial structure into a smooth patch.
@@ -224,7 +230,7 @@ def _restoration_is_plausible(
     restored_sharpness = float(cv2.Laplacian(restored_gray, cv2.CV_32F).var())
     if (camera_sharpness >= 18.0
             and restored_sharpness < max(1.5, camera_sharpness * 0.055)):
-        return False
+        return "detail_collapse"
 
     # Aligned crops from adjacent frames may change expression, but an abrupt
     # near-total structural replacement indicates a hallucinated identity.
@@ -250,8 +256,8 @@ def _restoration_is_plausible(
             if denom > 1e-6 else 1.0
         )
         if temporal_error > 82.0 and correlation < 0.12:
-            return False
-    return True
+            return "temporal_structure_change"
+    return None
 
 
 def _closeup_detail_strength(
@@ -314,7 +320,7 @@ def blend_high_frequency(
     # stronger, structured skin detail. Unlike a final blur, this does not
     # soften the eyes, nose or face boundary.
     high_frequency = np.sign(high_frequency) * np.maximum(
-        np.abs(high_frequency) - 0.8, 0.0
+        np.abs(high_frequency) - 1.5, 0.0
     )
     high_frequency = np.clip(high_frequency, -24.0, 24.0)
     blended = np.clip(restored + high_frequency * strength, 0.0, 255.0)
@@ -494,8 +500,9 @@ def enhance_face_onnx(
                 print("[GPEN] Inference failed; keeping current swapped frame", flush=True)
                 return frame
             raise
+        previous_restored = cache.get("enhanced")
         if live and not _restoration_is_plausible(
-            face_crop, restored, cache.get("enhanced")
+            face_crop, restored, previous_restored
         ):
             cache["reject_count"] = int(cache.get("reject_count", 0)) + 1
             cache["reject_log_count"] = int(
@@ -512,7 +519,14 @@ def enhance_face_onnx(
             # A difficult pose can reject many consecutive enhancer frames.
             # Report the state without flooding the terminal every frame.
             if cache["reject_log_count"] == 1 or cache["reject_log_count"] % 30 == 0:
-                print("[GPEN] Rejected unstable restoration; keeping current swapped frame", flush=True)
+                reason = _restoration_rejection_reason(
+                    face_crop, restored, previous_restored
+                ) or "restoration_guard"
+                print(
+                    f"[GPEN] Rejected restoration ({reason}); "
+                    "keeping current swapped frame",
+                    flush=True,
+                )
             return frame
         if live:
             cache["enhanced"] = restored
