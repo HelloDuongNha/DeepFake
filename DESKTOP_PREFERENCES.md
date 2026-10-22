@@ -1,5 +1,13 @@
 # Source history, saved preferences and feature contours
 
+## Live orientation
+
+The Dọc / Ngang button beside Live switches the preview immediately and saves
+the choice for the next launch. Dọc keeps the existing portrait fill/crop.
+Ngang sizes the window to the actual camera aspect ratio and fits the complete
+frame without cropping or stretching, including after manual window resizing.
+Camera capture, mask processing and upstream frame dimensions are unchanged.
+
 ## Source images and restart
 
 Select a face once. The next desktop launch restores that image and its preview.

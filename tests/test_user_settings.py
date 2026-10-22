@@ -17,6 +17,7 @@ class PreferenceTests(unittest.TestCase):
             image=Path(folder)/'tên ảnh.png';image.write_bytes(b'test')
             state=defaults();state.source_path=str(image);state.source_history=[str(image),str(image)]
             state.opacity=.37;state.sharpness=1.48;state.fp_ui={'face_enhancer_gpen256':True}
+            state.live_portrait=False
             state.preferred_camera_index=3;state.window_geometry='YWJj'
             self.assertTrue(prefs.save(state))
             restored=defaults();prefs.apply(prefs.read(),restored)
@@ -24,6 +25,7 @@ class PreferenceTests(unittest.TestCase):
             self.assertEqual(restored.opacity,.37);self.assertEqual(restored.sharpness,1.48)
             self.assertTrue(restored.fp_ui['face_enhancer_gpen256']);self.assertEqual(restored.preferred_camera_index,3)
             self.assertEqual(restored.window_geometry,'YWJj')
+            self.assertFalse(restored.live_portrait)
 
     def test_corrupt_types_and_missing_file_are_safe(self):
         with tempfile.TemporaryDirectory() as folder,patch('modules.paths.SETTINGS_PATH',str(Path(folder)/'settings.json')):
