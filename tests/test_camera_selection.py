@@ -99,10 +99,15 @@ class CameraShutdownTests(unittest.TestCase):
             _capture_worker=Worker(),
             _processing_worker=Worker(),
             _cap=SimpleNamespace(release=lambda: calls.append("release")),
+            saveGeometry=lambda: ui.QByteArray(b"preview geometry"),
         )
         event = Mock()
-        with patch.object(ui, "_WEBCAM_PREVIEW", preview):
+        with patch.object(ui, "_WEBCAM_PREVIEW", preview), \
+             patch.object(ui, "save_switch_states") as save_settings, \
+             patch.object(ui.modules.globals, "live_window_geometry", ""):
             ui.WebcamPreviewWindow.closeEvent(preview, event)
             self.assertIsNone(ui._WEBCAM_PREVIEW)
+            self.assertEqual(ui.modules.globals.live_window_geometry, "cHJldmlldyBnZW9tZXRyeQ==")
+            save_settings.assert_called_once()
         self.assertEqual(calls, ["stop", ("wait", ()), ("wait", ()), "release"])
         event.accept.assert_called_once()

@@ -1,14 +1,27 @@
 # Natural 256 camera rendering
 
 For source launches (`run.py` or `run_mac.sh`), choose **Face model: Natural 256**,
-**Face Enhancer: GPEN-256**, and keep **Natural mouth** enabled. Stop Live before
+**Face Enhancer: GPEN-256**, and keep **Natural teeth** enabled. Stop Live before
 changing models. INSwapper 128 remains available in the same selector.
+HyperSwap 1B/1C are also selectable; AlphaFace has been removed after the user's
+comparison. Natural eyes preserves the
+camera iris/gaze inside the tracked eyelids, while brows and surrounding skin
+remain swapped. It can be disabled independently for comparison.
+Natural nose is opt-in: it restores the current camera nose tip/nostrils, rather
+than retaining the source portrait's lower nose shape. RestoreFormer++ is now
+selectable as a quality experiment, but measured roughly twice the processing
+time of GPEN-256 on the supplied still image. GPEN-256 remains recommended for Live.
+Hand protection is enabled by default and restores current camera foreground
+after all face processing using XSeg 2. It adds inference time (44ms median in
+the latest raw hand-video sample) and can be disabled for comparison. Natural
+nose now extends its feather below the nostril shadow to reduce the soft seam.
+Natural mouth is now labeled Natural teeth; its saved setting is unchanged.
 `DLC_SWAP_MODEL=inswapper_128` explicitly selects the previous engine at startup.
 
 Natural 256 uses HyperSwap-1a's native 256px output and the existing tracker,
 anatomical mask, color matching and paste-back. GPEN contributes 40% after a
-successful native swap. Eye detail now applies bounded local contrast to the
-current eyes/brows; Live no longer runs a second GFPGAN eye restoration. Camera
+successful native swap. The Mask switch replaces Eye detail. OFF shows the original camera and bypasses
+AI processing; ON resumes the selected model. Eye detail is removed from Live. Camera
 microtexture is reduced to avoid bringing back the camera subject's features.
 Tiny cheek marks detected in the camera but absent from the aligned source
 portrait receive local inpainting; eyes, nostrils and lips are excluded. This

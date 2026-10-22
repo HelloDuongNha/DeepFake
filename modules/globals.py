@@ -84,12 +84,25 @@ video_quality: int | None = None # Typically a CRF value or bitrate
 # Live Mode Options
 live_mirror: bool = False
 live_resizable: bool = True
+live_portrait: bool = True
 camera_input_combobox: Any | None = None # Placeholder for UI element if needed
 webcam_preview_running: bool = False
 show_fps: bool = False
-eye_detail: bool = os.environ.get("DLC_EYE_DETAIL", "0") != "0"
+occlusion_protection: bool = True
+natural_nose: bool = False
+natural_eyes: bool = True
+eyelid_repair: bool = True
+forehead_guard: bool = True
+nose_edge_repair: bool = True
+source_history: list[str] = []
+preferred_camera_index: int | None = None
+window_geometry: str = ""
+live_window_geometry: str = ""
+mask_enabled: bool = True
+eye_detail: bool = False  # Legacy compatibility; removed from the Live pipeline.
 swapper_model: str = os.environ.get("DLC_SWAP_MODEL", "hyperswap_256")
-if swapper_model not in {"hyperswap_256", "inswapper_128"}:
+from modules.swap_models import SWAP_MODELS
+if swapper_model not in SWAP_MODELS:
     swapper_model = "hyperswap_256"
 preserve_inner_mouth: bool = os.environ.get("DLC_PRESERVE_INNER_MOUTH", "1") != "0"
 

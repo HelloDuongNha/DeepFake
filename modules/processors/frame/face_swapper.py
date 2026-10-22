@@ -5,6 +5,7 @@ import logging
 import threading
 import numpy as np
 import platform
+from modules.swap_models import SWAP_MODELS
 import modules.globals
 import modules.processors.frame.core
 from modules import imread_unicode, imwrite_unicode
@@ -266,8 +267,8 @@ def pre_check() -> bool:
 
     from modules.model_downloader import ensure_any, ensure_model
 
-    if modules.globals.swapper_model == "hyperswap_256":
-        if ensure_model("hyperswap_1a_256.onnx") is not None:
+    if modules.globals.swapper_model != "inswapper_128":
+        if ensure_model(SWAP_MODELS[modules.globals.swapper_model][1]) is not None:
             return True
         update_status("Natural 256 model unavailable; checking the existing INSwapper fallback.", NAME)
 
@@ -285,7 +286,7 @@ def pre_check() -> bool:
 
 
 def pre_start() -> bool:
-    if modules.globals.swapper_model == "hyperswap_256":
+    if modules.globals.swapper_model != "inswapper_128":
         return get_face_swapper() is not None
     # Check for either model variant
     fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
@@ -307,16 +308,16 @@ def get_face_swapper() -> Any:
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            if modules.globals.swapper_model == "hyperswap_256":
+            if modules.globals.swapper_model != "inswapper_128":
                 from modules.model_downloader import ensure_model
                 from modules.processors.frame.natural_swapper import Natural256Swapper
                 from modules.processors.frame._onnx_enhancer import build_provider_config
 
-                path = ensure_model("hyperswap_1a_256.onnx")
+                path = ensure_model(SWAP_MODELS[modules.globals.swapper_model][1])
                 if path is not None:
                     try:
-                        FACE_SWAPPER = Natural256Swapper(path, build_provider_config())
-                        update_status("HyperSwap-256 loaded (native 256px).", NAME)
+                        FACE_SWAPPER = Natural256Swapper(path, build_provider_config(), modules.globals.swapper_model)
+                        update_status(f"{modules.globals.swapper_model} loaded (native 256px).", NAME)
                         return FACE_SWAPPER
                     except Exception as error:
                         update_status(f"Natural 256 load failed; retaining INSwapper fallback: {error}", NAME)
@@ -395,7 +396,8 @@ def get_face_swapper() -> Any:
 def select_swapper_model(name: str) -> None:
     """Switch model only while the camera is stopped, then reload on start."""
     global FACE_SWAPPER
-    if name not in {"hyperswap_256", "inswapper_128"}:
+    from modules.swap_models import SWAP_MODELS
+    if name not in SWAP_MODELS:
         raise ValueError(f"Unknown face model: {name}")
     with THREAD_LOCK:
         modules.globals.swapper_model = name
@@ -579,6 +581,7 @@ def _restore_camera_microtexture(
     generated_face: np.ndarray,
     camera_face: np.ndarray,
     strength: float,
+    protect_nose: bool = False,
 ) -> np.ndarray:
     """Restore camera wrinkles/pores without copying low-frequency identity."""
     if (generated_face is None or camera_face is None
@@ -616,6 +619,14 @@ def _restore_camera_microtexture(
     from modules.processors.frame.face_detail import skin_microtexture_gate
 
     alpha *= skin_microtexture_gate(camera_u8)
+    if protect_nose:
+        # Real alar edges are anatomy, not skin texture. Adding their residual
+        # over a narrower generated nose creates a second side contour.
+        nose_gate=np.full((height,width),255,np.uint8)
+        cv2.ellipse(nose_gate,(round(width*.5),round(height*.56)),
+                    (max(1,round(width*.17)),max(1,round(height*.15))),0,0,360,0,-1)
+        nose_gate=cv2.GaussianBlur(nose_gate,(0,0),max(.6,width*.008))
+        alpha*=nose_gate.astype(np.float32)/255.
     restored = (
         generated_face.astype(np.float32)
         + detail * (amount * alpha[:, :, None])
@@ -1101,6 +1112,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
             min(float(getattr(modules.globals, "detail_strength", 0.58)) * 0.62, .18)
             if getattr(face_swapper, "native_resolution", 128) >= 256
             else float(getattr(modules.globals, "detail_strength", 0.58)) * 0.62,
+            protect_nose=modules.globals.nose_edge_repair and not modules.globals.natural_nose,
         )
         _SWAP_STATE.model_delta = float(np.mean(
             cv2.absdiff(bgr_fake, camera_face_crop)

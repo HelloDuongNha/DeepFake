@@ -1,0 +1,20 @@
+[
+  {
+    "sample": "sample-0",
+    "guard_ms": 21.01204197970219,
+    "changed_pixels": 72957,
+    "lower_face_exact": true
+  },
+  {
+    "sample": "sample-1",
+    "guard_ms": 17.116291011916474,
+    "changed_pixels": 119474,
+    "lower_face_exact": true
+  },
+  {
+    "sample": "sample-2",
+    "guard_ms": 12.205625011119992,
+    "changed_pixels": 103708,
+    "lower_face_exact": true
+  }
+]

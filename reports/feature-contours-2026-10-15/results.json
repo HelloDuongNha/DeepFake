@@ -1,0 +1,17 @@
+[
+  {
+    "frame": 78,
+    "repair_ms": 3.536540985805914,
+    "changed_pixels": 8035
+  },
+  {
+    "frame": 234,
+    "repair_ms": 5.595082999207079,
+    "changed_pixels": 11824
+  },
+  {
+    "frame": 625,
+    "repair_ms": 5.6472920114174485,
+    "changed_pixels": 10158
+  }
+]

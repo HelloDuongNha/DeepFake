@@ -3,11 +3,12 @@
 import os
 
 from modules.paths import CACHE_DIR, DATA_DIR, IS_PACKAGED, MODELS_DIR, RESOURCE_DIR
+from modules.swap_models import SWAP_MODELS
 
 
 CORE_MODELS = (
-    ("inswapper_128.onnx" if os.environ.get("DLC_SWAP_MODEL") == "inswapper_128"
-     else "hyperswap_1a_256.onnx"), "GPEN-BFR-256.onnx",
+    SWAP_MODELS.get(os.environ.get("DLC_SWAP_MODEL"), SWAP_MODELS['hyperswap_256'])[1],
+    "GPEN-BFR-256.onnx",
     "buffalo_l/2d106det.onnx", "buffalo_l/det_10g.onnx",
     "buffalo_l/w600k_r50.onnx",
 )

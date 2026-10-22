@@ -10,7 +10,8 @@ fi
 
 export DLC_PROFILE=mac-smooth
 export DLC_SOURCE_DIR="${DLC_SOURCE_DIR:-$PROJECT_DIR/source_faces}"
-export DLC_ENHANCER="${DLC_ENHANCER:-GPEN-256}"
+# The app defaults to GPEN-256 on first launch and restores the user's choice.
+# Export DLC_ENHANCER explicitly only when intentionally overriding preferences.
 export DLC_ENHANCER_INTERVAL="${DLC_ENHANCER_INTERVAL:-1}"
 export DLC_MASK_BLUR="${DLC_MASK_BLUR:-1.5}"
 export DLC_MASK_EROSION="${DLC_MASK_EROSION:-4}"

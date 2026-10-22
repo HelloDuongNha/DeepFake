@@ -66,10 +66,13 @@ class Natural256Swapper:
     input_size = (256, 256)
     native_resolution = 256
 
-    def __init__(self, model_path: str, providers):
+    def __init__(self, model_path: str, providers, model_name='hyperswap_256'):
+        from modules.swap_models import SWAP_MODELS
+        self.model_name = model_name
+        expected_hash = SWAP_MODELS[model_name][3]
         with open(model_path, "rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
-        if digest != MODEL_SHA256:
+        if digest != expected_hash:
             raise ValueError("HyperSwap model checksum mismatch; download the original model again")
         from modules.onnx_optimize import optimize_for_coreml
 
@@ -86,13 +89,26 @@ class Natural256Swapper:
                                 flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         target = camera[:, :, ::-1].astype(np.float32) / 127.5 - 1.
         target = np.ascontiguousarray(target.transpose(2, 0, 1)[None])
-        identity = np.asarray(source_face.normed_embedding, np.float32).reshape(1, 512)
+        identity = np.asarray(source_face.normed_embedding,
+                              np.float32).reshape(1, 512)
         output = self.session.run(self.output_names, {"source": identity, "target": target})[0]
         if output.shape != (1, 3, 256, 256) or not np.isfinite(output).all():
             raise ValueError("Invalid HyperSwap face output")
+        image = output[0].transpose(1, 2, 0)[:, :, ::-1]
         generated = np.rint(np.clip(
-            (output[0].transpose(1, 2, 0)[:, :, ::-1] + 1.) * 127.5, 0, 255
+            (image + 1.) * 127.5, 0, 255
         )).astype(np.uint8)
+        import modules.globals as settings
+        if settings.nose_edge_repair and not settings.natural_nose:
+            landmarks=getattr(target_face,"landmark_2d_106",None)
+            kps=np.asarray(target_face.kps,np.float32)
+            span=float(np.linalg.norm(kps[1]-kps[0]))
+            yaw=abs(float(kps[2,0]-np.mean(kps[:2,0])))/max(1.,span)
+            valid=(np.asarray(landmarks,np.float32) if landmarks is not None else None)
+            if valid is not None and valid.shape==(106,2) and np.isfinite(valid).all() and yaw<.24:
+                from modules.processors.frame.face_detail import suppress_model_nose_ridges
+                points=cv2.transform(valid[None],affine)[0]
+                generated=suppress_model_nose_ridges(generated,points)
         generated = remove_target_only_marks(
             generated, camera, getattr(source_face, "skin_reference", None)
         )

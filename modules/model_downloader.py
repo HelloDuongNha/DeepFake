@@ -12,11 +12,15 @@ HF_REPO_ID = "hacksider/deep-live-cam"
 HF_RESOLVE_BASE = f"https://huggingface.co/{HF_REPO_ID}/resolve/main/"
 
 MODEL_SIZES: Dict[str, int] = {
+    "xseg_2.onnx": 70324286,
     "hyperswap_1a_256.onnx": 402742682,
+    "hyperswap_1b_256.onnx": 402742682,
+    "hyperswap_1c_256.onnx": 402742682,
     "inswapper_128.onnx": 554253681,
     "inswapper_128_fp16.onnx": 277680638,
     "gfpgan-1024.onnx": 365875079,
     "GPEN-BFR-256.onnx": 75715262,
+    "restoreformer_plus_plus.onnx": 294264232,
     "GPEN-BFR-512.onnx": 284244491,
     "buffalo_l/buffalo_l/1k3d68.onnx": 143607619,
     "buffalo_l/buffalo_l/2d106det.onnx": 5030888,
@@ -44,8 +48,14 @@ def _lock_for(key: str) -> threading.Lock:
 
 
 def resolve_url(name: str) -> str:
-    if name == "hyperswap_1a_256.onnx":
-        return "https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1a_256.onnx"
+    if name == "xseg_2.onnx":
+        return "https://github.com/facefusion/facefusion-assets/releases/download/models-3.1.0/xseg_2.onnx"
+    if name == "restoreformer_plus_plus.onnx":
+        return "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/restoreformer_plus_plus.onnx"
+    from modules.swap_models import SWAP_MODELS
+    for _, filename, release, _ in SWAP_MODELS.values():
+        if name == filename and release:
+            return f"https://github.com/facefusion/facefusion-assets/releases/download/{release}/{filename}"
     return HF_RESOLVE_BASE + name.replace(os.sep, "/")
 
 

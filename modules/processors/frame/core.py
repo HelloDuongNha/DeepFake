@@ -28,6 +28,7 @@ ALLOWED_PROCESSORS = {
     'face_swapper',
     'face_enhancer',
     'face_enhancer_gpen256',
+    'face_enhancer_restoreformer',
     'face_enhancer_gpen512'
 }
 
